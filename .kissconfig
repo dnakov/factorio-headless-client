@@ -1,0 +1,44 @@
+# Kiss code quality thresholds
+# Generated from current codebase, relaxed for reverse-engineering project
+
+[gate]
+test_coverage_threshold = 0   # Skip test coverage for RE project
+min_similarity = 1.0          # Only flag exact duplicates
+
+[python]
+statements_per_function = 266
+positional_args = 2
+keyword_only_args = 0
+max_indentation = 5
+nested_function_depth = 0
+returns_per_function = 10
+branches_per_function = 48
+local_variables = 52
+methods_per_class = 13
+statements_per_file = 524
+types_per_file = 2
+imported_names_per_file = 16
+transitive_dependencies = 19
+dependency_depth = 1
+statements_per_try_block = 20
+boolean_parameters = 1
+decorators_per_function = 3
+cycle_size = 3
+
+[rust]
+statements_per_function = 256
+arguments = 6
+max_indentation = 10
+nested_function_depth = 2
+returns_per_function = 15
+branches_per_function = 63
+local_variables = 59
+methods_per_class = 84
+statements_per_file = 1478
+types_per_file = 20
+imported_names_per_file = 10
+transitive_dependencies = 34
+dependency_depth = 2
+boolean_parameters = 2
+attributes_per_function = 4
+cycle_size = 3
