@@ -5,6 +5,7 @@ pub mod input_action;
 pub mod map_types;
 pub mod map_settings;
 pub mod map_transfer;
+pub mod entity_parsers;
 pub mod heartbeat;
 pub mod tick_closure;
 pub mod synchronizer_action;

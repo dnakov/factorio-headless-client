@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::protocol::{Connection, ConnectionState};
 use crate::state::{GameWorld, PlayerId};
+use crate::state::entity::entity_type_from_name;
 use crate::client::events::{GameEvent, EventCollector};
 
 /// Client configuration
@@ -64,13 +65,48 @@ impl Session {
         connection.connect().await?;
 
         let local_player_id = connection.player_index();
+        let mut world = GameWorld::new();
+
+        if let Some(map) = connection.parsed_map.take() {
+            Self::populate_world_from_map(&mut world, &map);
+        }
 
         Ok(Self {
             connection,
-            world: GameWorld::new(),
+            world,
             local_player_id,
             events: EventCollector::new(),
         })
+    }
+
+    fn populate_world_from_map(world: &mut GameWorld, map: &crate::codec::map_transfer::MapData) {
+        world.seed = map.seed;
+        world.tick = map.ticks_played;
+
+        if let Some(nauvis) = world.nauvis_mut() {
+            for tile in &map.tiles {
+                let chunk_pos = crate::codec::ChunkPosition {
+                    x: tile.x.div_euclid(32),
+                    y: tile.y.div_euclid(32),
+                };
+                let chunk = nauvis.get_or_create_chunk(chunk_pos);
+                chunk.generated = true;
+                let lx = tile.x.rem_euclid(32) as u8;
+                let ly = tile.y.rem_euclid(32) as u8;
+                chunk.set_tile(lx, ly, crate::state::surface::Tile::new(&tile.name));
+            }
+
+            for map_ent in &map.entities {
+                let id = nauvis.entities.len() as u32 + 1;
+                let pos = crate::codec::MapPosition {
+                    x: crate::codec::Fixed32((map_ent.x * 256.0) as i32),
+                    y: crate::codec::Fixed32((map_ent.y * 256.0) as i32),
+                };
+                let mut entity = crate::state::entity::Entity::new(id, map_ent.name.clone(), pos);
+                entity.entity_type = entity_type_from_name(&map_ent.name);
+                nauvis.entities.insert(id, entity);
+            }
+        }
     }
 
     /// Get the current game world state

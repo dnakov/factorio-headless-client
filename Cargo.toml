@@ -73,6 +73,10 @@ path = "src/bin/factorio_daemon.rs"
 name = "tile-decode-test"
 path = "src/bin/tile_decode_test.rs"
 
+[[bin]]
+name = "entity-debug"
+path = "src/bin/entity_debug.rs"
+
 [features]
 default = []
 tui = ["ratatui", "crossterm", "unicode-width"]

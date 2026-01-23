@@ -24,6 +24,10 @@ impl<'a> BinaryReader<'a> {
         self.pos
     }
 
+    pub fn set_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.remaining() == 0
     }

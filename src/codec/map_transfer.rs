@@ -137,7 +137,7 @@ impl<'a> MapDeserializer<'a> {
     }
 }
 
-fn read_map_position_delta(reader: &mut BinaryReader, last: &mut (i32, i32)) -> Result<(i32, i32)> {
+pub fn read_map_position_delta(reader: &mut BinaryReader, last: &mut (i32, i32)) -> Result<(i32, i32)> {
     let dx = reader.read_i16_le()?;
     if dx == 0x7FFF {
         let x = reader.read_i32_le()?;
@@ -2668,6 +2668,91 @@ fn decode_tile_blob(
     Ok((tiles, cross_chunk_fills))
 }
 
+/// Scan for entity data in chunks by finding "C:"/"/T" boundaries.
+/// Entity sections extend from after "/T" to the next "C:" marker (or end of data).
+/// The parser naturally terminates at proto_id==0 or unknown types.
+fn scan_for_entities(
+    data: &[u8],
+    entity_prototypes: &HashMap<u16, String>,
+    chunk_positions: Option<&Vec<ChunkPrelude>>,
+) -> Vec<MapEntity> {
+    let debug = std::env::var("FACTORIO_DEBUG").is_ok();
+    let mut all_entities = Vec::new();
+    let mut chunks_parsed = 0usize;
+    let mut chunks_failed = 0usize;
+
+    // Find all chunk starts (entity data begins after "/T")
+    let mut chunk_starts = Vec::new(); // (byte_offset, entity_start)
+    for i in 0..data.len().saturating_sub(10) {
+        if data[i] != 0x43 || data[i + 1] != 0x3a {
+            continue;
+        }
+        let tile_blob_len = u16::from_le_bytes([data[i + 6], data[i + 7]]) as usize;
+        if tile_blob_len == 0 || tile_blob_len > 0x1000 {
+            continue;
+        }
+        let tile_end = i + 8 + tile_blob_len;
+        if tile_end + 2 > data.len() {
+            continue;
+        }
+        if data[tile_end] != 0x2f || data[tile_end + 1] != 0x54 {
+            continue;
+        }
+        chunk_starts.push((i, tile_end + 2));
+    }
+
+    chunk_starts.sort_by_key(|(start, _)| *start);
+
+    for ordinal in 0..chunk_starts.len() {
+        let (_chunk_start, entity_start) = chunk_starts[ordinal];
+        // Entity section extends to the next chunk's "C:" or end of data
+        let entity_end = chunk_starts.get(ordinal + 1)
+            .map(|(next_start, _)| *next_start)
+            .unwrap_or(data.len());
+
+        let (chunk_x, chunk_y) = chunk_positions
+            .and_then(|positions| positions.get(ordinal))
+            .map(|chunk| chunk.position)
+            .unwrap_or_else(|| {
+                let total = chunk_starts.len();
+                let side = (total as f64).sqrt().ceil() as i32;
+                let half = side / 2;
+                ((ordinal as i32 / side) - half, (ordinal as i32 % side) - half)
+            });
+
+        let entity_data = &data[entity_start..entity_end];
+        let parsed = super::entity_parsers::parse_chunk_entities(
+            entity_data,
+            chunk_x,
+            chunk_y,
+            entity_prototypes,
+        );
+
+        if parsed.is_empty() {
+            chunks_failed += 1;
+        } else {
+            chunks_parsed += 1;
+            for result in parsed {
+                all_entities.push(MapEntity {
+                    name: result.name,
+                    x: result.position.0 as f64 / 256.0,
+                    y: result.position.1 as f64 / 256.0,
+                    direction: 0,
+                });
+            }
+        }
+    }
+
+    if debug || !all_entities.is_empty() {
+        eprintln!(
+            "[MAP] Parsed {} entities from {} chunks ({} chunks had no parseable entities)",
+            all_entities.len(), chunks_parsed, chunks_failed
+        );
+    }
+
+    all_entities
+}
+
 /// Scan for tile data by finding "/T" markers and working backwards
 fn scan_for_tiles(
     data: &[u8],
@@ -2937,14 +3022,18 @@ fn parse_zip_map(data: &[u8]) -> Result<MapData> {
     let item_prototypes = stream.prototype_mappings.tables.get("ItemPrototype").cloned().unwrap_or_default();
     let recipe_prototypes = stream.prototype_mappings.tables.get("Recipe").cloned().unwrap_or_default();
 
-    let entities = Vec::new();
-
     let seed = stream.seed;
     if seed != 0 {
         eprintln!("[MAP] Using map seed {} for procedural terrain", seed);
     }
 
     let first_surface_positions = surface_preludes.get(0).map(|s| &s.chunks);
+
+    let entities = scan_for_entities(
+        &full_stream,
+        &entity_prototypes,
+        first_surface_positions,
+    );
     let mut tiles = scan_for_tiles(
         &full_stream,
         &stream.prototype_mappings,

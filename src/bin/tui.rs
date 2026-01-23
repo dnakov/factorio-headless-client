@@ -446,11 +446,16 @@ mod tui_main {
                         Ok(size) => {
                             app.map_size = size;
                             app.entities = conn.entities().to_vec();
+                            if let Ok(map) = parse_map_data(conn.map_data()) {
+                                app.tiles = map.tiles;
+                                app.tile_index = build_tile_index(&app.tiles);
+                                app.map_seed = map.seed;
+                            }
                             let (x, y) = conn.player_position();
                             app.player_x = x;
                             app.player_y = y;
-                            app.log(format!("Map loaded: {} KB, {} entities",
-                                size / 1024, app.entities.len()), Color::Green);
+                            app.log(format!("Map: {} KB, {} entities, {} tiles",
+                                size / 1024, app.entities.len(), app.tiles.len()), Color::Green);
                             app.state = AppState::Connected;
                             app.status = "Connected".into();
                         }
@@ -944,15 +949,17 @@ mod tui_main {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),  // Cursor info
-                Constraint::Min(5),     // Log
+                Constraint::Length(7),  // Cursor + entity info
+                Constraint::Length(8),  // Entity counts
+                Constraint::Min(5),    // Log
             ])
             .split(area);
 
-        // Cursor info
+        // Cursor info + entity under cursor
         let (cx, cy) = app.cursor_world_pos();
+        let cursor_entity = app.entity_at_cursor();
 
-        let cursor_info = vec![
+        let mut cursor_info = vec![
             Line::from(vec![
                 Span::raw("World: "),
                 Span::styled(format!("({:.1}, {:.1})", cx, cy), Style::default().fg(Color::Cyan)),
@@ -962,6 +969,13 @@ mod tui_main {
                 Span::styled(format!("({}, {})", app.cursor_dx, app.cursor_dy), Style::default().fg(Color::Yellow)),
             ]),
         ];
+        if let Some(ent) = cursor_entity {
+            let (icon, color) = entity_icon(&ent.name);
+            cursor_info.push(Line::from(vec![
+                Span::styled(icon, Style::default().fg(color)),
+                Span::styled(&ent.name, Style::default().fg(color)),
+            ]));
+        }
 
         let cursor_block = Block::default()
             .borders(Borders::ALL)
@@ -969,8 +983,48 @@ mod tui_main {
             .title(" Cursor ");
         frame.render_widget(Paragraph::new(cursor_info).block(cursor_block), chunks[0]);
 
+        // Entity/resource counts
+        let total = app.entities.len();
+        let trees = app.entities.iter().filter(|e| e.name.starts_with("tree-") || e.name.starts_with("dead-")).count();
+        let rocks = app.entities.iter().filter(|e| e.name.contains("rock") && !e.name.contains("rocket")).count();
+        let iron = app.entities.iter().filter(|e| e.name == "iron-ore").count();
+        let copper = app.entities.iter().filter(|e| e.name == "copper-ore").count();
+        let coal = app.entities.iter().filter(|e| e.name == "coal").count();
+        let stone = app.entities.iter().filter(|e| e.name == "stone").count();
+
+        let entity_lines = vec![
+            Line::from(vec![
+                Span::raw("Total: "),
+                Span::styled(format!("{}", total), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Fe:", Style::default().fg(Color::LightBlue)),
+                Span::raw(format!("{} ", iron)),
+                Span::styled("Cu:", Style::default().fg(Color::Rgb(255, 140, 0))),
+                Span::raw(format!("{}", copper)),
+            ]),
+            Line::from(vec![
+                Span::styled("C:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{} ", coal)),
+                Span::styled("St:", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{}", stone)),
+            ]),
+            Line::from(vec![
+                Span::styled("Trees:", Style::default().fg(Color::Green)),
+                Span::raw(format!("{} ", trees)),
+                Span::styled("Rock:", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{}", rocks)),
+            ]),
+        ];
+
+        let entity_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Entities ");
+        frame.render_widget(Paragraph::new(entity_lines).block(entity_block), chunks[1]);
+
         // Log
-        let log_height = chunks[1].height.saturating_sub(2) as usize;
+        let log_height = chunks[2].height.saturating_sub(2) as usize;
         let log_lines: Vec<Line> = app.log.iter()
             .rev()
             .take(log_height)
@@ -984,7 +1038,7 @@ mod tui_main {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Log ");
-        frame.render_widget(Paragraph::new(log_lines).block(log_block), chunks[1]);
+        frame.render_widget(Paragraph::new(log_lines).block(log_block), chunks[2]);
     }
 
     fn render_footer(frame: &mut Frame, app: &App, area: Rect) {

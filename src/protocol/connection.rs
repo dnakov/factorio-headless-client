@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::codec::{
     BinaryReader, BinaryWriter, Direction, InputAction as CodecInputAction, InputActionType,
     MapEntity, MapPosition, ShootingState, SynchronizerActionType, parse_map_data,
+    map_transfer::MapData,
 };
 use crate::error::{Error, Result};
 use crate::protocol::message::{
@@ -138,6 +139,7 @@ pub struct Connection {
     // Map data
     map_data: Vec<u8>,
     entities: Vec<MapEntity>,
+    pub(crate) parsed_map: Option<MapData>,
 
     // Pending confirmations for reliable messages we received
     pending_confirms: Vec<u32>,
@@ -215,6 +217,7 @@ impl Connection {
             map_transfer_size: None,
             map_data: Vec::new(),
             entities: Vec::new(),
+            parsed_map: None,
             pending_confirms: Vec::new(),
             chat_seq: 1,
             pending_actions: VecDeque::new(),
@@ -1071,16 +1074,14 @@ impl Connection {
 
             // Try to parse entities from the map
             if let Ok(parsed) = parse_map_data(&self.map_data) {
-                // Store initial player (character) positions from map (before moving entities)
                 self.initial_player_positions = parsed.character_positions();
-                // Get character speed from prototype data
                 self.character_speed = parsed.character_speed();
-                self.entities = parsed.entities;
-                // Set spawn position if available
+                self.entities = parsed.entities.clone();
                 if parsed.player_spawn != (0.0, 0.0) {
                     self.player_x = parsed.player_spawn.0;
                     self.player_y = parsed.player_spawn.1;
                 }
+                self.parsed_map = Some(parsed);
             }
 
             // Send state transition to signal we're ready for gameplay

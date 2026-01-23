@@ -136,6 +136,36 @@ pub enum EntityType {
 }
 
 
+pub fn entity_type_from_name(name: &str) -> EntityType {
+    match name {
+        n if n.ends_with("-ore") || n == "crude-oil" || n == "uranium-ore" => EntityType::Resource,
+        n if n.starts_with("tree-") || n.starts_with("dead-") => EntityType::Tree,
+        n if n.starts_with("simple-entity") => EntityType::SimpleEntity,
+        "fish" => EntityType::Fish,
+        "character" => EntityType::Character,
+        n if n.contains("transport-belt") => EntityType::TransportBelt,
+        n if n.contains("underground-belt") => EntityType::UndergroundBelt,
+        n if n.contains("splitter") => EntityType::Splitter,
+        n if n.contains("inserter") => EntityType::Inserter,
+        n if n.contains("assembling-machine") => EntityType::AssemblingMachine,
+        n if n.contains("furnace") => EntityType::Furnace,
+        n if n.contains("mining-drill") => EntityType::MiningDrill,
+        n if n.contains("electric-pole") || n.contains("substation") => EntityType::ElectricPole,
+        n if n.contains("pipe") && !n.contains("heat") => EntityType::Pipe,
+        n if n.contains("chest") || n.contains("container") => EntityType::Container,
+        n if n.contains("turret") => EntityType::Turret,
+        n if n.contains("wall") => EntityType::Wall,
+        n if n.contains("radar") => EntityType::Radar,
+        n if n.contains("roboport") => EntityType::Roboport,
+        n if n.contains("solar-panel") => EntityType::SolarPanel,
+        n if n.contains("accumulator") => EntityType::Accumulator,
+        n if n.contains("lab") => EntityType::Lab,
+        n if n.contains("cliff") => EntityType::Cliff,
+        n if n.contains("lamp") => EntityType::Lamp,
+        _ => EntityType::Unknown,
+    }
+}
+
 /// Entity-specific data
 #[derive(Debug, Clone)]
 pub enum EntityData {
