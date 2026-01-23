@@ -6,7 +6,7 @@ use crate::codec::BinaryReader;
 use crate::error::{Error, Result};
 use super::map_types::{SurfaceData, ChunkData};
 use super::map_settings::skip_map_settings;
-use factorio_mapgen::FastTerrain;
+use factorio_mapgen::TerrainGenerator;
 
 /// Map data decompressor and parser
 pub struct MapTransfer {
@@ -2554,84 +2554,98 @@ enum DecodedTile {
     Procedural(String),
 }
 
-/// Decode tile blob (RLE format, Space Age 2.0 new format).
-/// Format: repeat { u8 run_len, u16 tile_id, u8 flags[run_len] } until 32*32 tiles.
-/// Returns tile_id per tile in row-major order.
-/// Missing tiles are filled with procedurally generated terrain based on seed.
-/// Decode the tile side length from a flag byte's upper nibble.
-/// nibble 0 (0x0_): 2x2 tile
-/// nibble 1 (0x1_): 1x1 tile
-/// nibble 2 (0x2_): 4x4 tile
-/// nibble 3 (0x3_): 1x1 tile
-fn flag_tile_side(flag: u8) -> usize {
-    match (flag >> 4) & 0x3 {
-        0 => 2,
-        2 => 4,
-        _ => 1,
+fn tile_size_mask(tile_name: Option<&String>) -> u8 {
+    match tile_name.map(|s| s.as_str()) {
+        Some("out-of-map") => 0x01,
+        Some("sand-1") | Some("sand-2") => 0x0F,
+        _ => 0x07, // sizes 1, 2, 4
     }
+}
+
+/// Cross-chunk fill entry: a position in a neighbor chunk pre-filled by a large tile
+struct CrossChunkFill {
+    local_idx: usize, // y * 32 + x within target chunk
+    tile_id: u16,
 }
 
 fn decode_tile_blob(
     data: &[u8],
     chunk_x: i32,
     chunk_y: i32,
-    seed: u32,
     out_of_map_id: u16,
-) -> Result<Vec<DecodedTile>> {
-    let mut pos = 0usize;
+    terrain: &TerrainGenerator,
+    prototype_mappings: &PrototypeMappings,
+    prefilled: &[(usize, u16)], // (local_idx, tile_id) from neighbor large tiles
+) -> Result<(Vec<DecodedTile>, Vec<((i32, i32), CrossChunkFill)>)> {
     let mut tile_ids = [out_of_map_id; 1024];
-    let mut flags = [0u8; 1024];
+    let mut filled = [false; 1024];
+
+    // Apply pre-fills from neighbor chunks' large tiles
+    for &(idx, tile_id) in prefilled {
+        if idx < 1024 {
+            tile_ids[idx] = tile_id;
+            filled[idx] = true;
+        }
+    }
+
+    let mut cross_chunk_fills: Vec<((i32, i32), CrossChunkFill)> = Vec::new();
+    let mut pos = 0usize;
     let mut remaining = 0u8;
     let mut current_tile_id = 0u16;
 
-    // Row-major: y outer, x inner (matches Tile::loadNewFormat)
-    'outer: for y in 0..32usize {
-        for x in 0..32usize {
+    // Column-major scan: x outer (0..31), y inner (0..31)
+    'outer: for x in 0..32usize {
+        for y in 0..32usize {
             let idx = y * 32 + x;
 
-            // Skip positions pre-filled by setupLargeTile
-            let f = flags[idx];
-            if f >= 0xE0 && (f & 0x10) == 0 {
-                continue;
-            }
+            if filled[idx] { continue; }
 
             if remaining == 0 {
-                if pos + 3 > data.len() {
-                    break 'outer;
-                }
+                if pos + 3 > data.len() { break 'outer; }
                 remaining = data[pos];
-                if remaining == 0 {
-                    return Err(Error::InvalidPacket(
-                        "Tile blob run_len cannot be zero".into(),
-                    ));
-                }
+                if remaining == 0 { break 'outer; }
                 current_tile_id = u16::from_le_bytes([data[pos + 1], data[pos + 2]]);
                 pos += 3;
             }
 
-            if pos >= data.len() {
-                break 'outer;
-            }
+            if pos >= data.len() { break 'outer; }
             let flag = data[pos];
             pos += 1;
             remaining -= 1;
 
-            let side = flag_tile_side(flag);
-
             tile_ids[idx] = current_tile_id;
-            flags[idx] = flag & 0xF0;
+            filled[idx] = true;
 
-            // setupLargeTile: fill NxN block for large tiles
-            if side > 1 {
-                for dy in 0..side {
-                    let dx_start = if dy == 0 { 1 } else { 0 };
-                    for dx in dx_start..side {
-                        let fx = x + dx;
-                        let fy = y + dy;
-                        if fx < 32 && fy < 32 {
-                            let fidx = fy * 32 + fx;
+            let masked = flag & 0xF0;
+            let size_index = if masked & 0x10 != 0 {
+                0
+            } else {
+                (masked >> 5) as u32 + 1
+            };
+
+            let size_mask = tile_size_mask(prototype_mappings.tile_name(current_tile_id));
+            if size_index > 0 && (size_mask >> size_index) & 1 != 0 {
+                let side = 1usize << size_index;
+                for dx in 0..side {
+                    let dy_start = if dx == 0 { 1 } else { 0 };
+                    for dy in dy_start..side {
+                        let gx = x + dx;
+                        let gy = y + dy;
+                        if gx < 32 && gy < 32 {
+                            let fidx = gy * 32 + gx;
                             tile_ids[fidx] = current_tile_id;
-                            flags[fidx] = 0xE0 | (dx as u8 & 0xF);
+                            filled[fidx] = true;
+                        } else {
+                            // Cross-chunk: compute target chunk and local position
+                            let target_cx = chunk_x + (gx / 32) as i32;
+                            let target_cy = chunk_y + (gy / 32) as i32;
+                            let local_x = gx % 32;
+                            let local_y = gy % 32;
+                            let local_idx = local_y * 32 + local_x;
+                            cross_chunk_fills.push((
+                                (target_cx, target_cy),
+                                CrossChunkFill { local_idx, tile_id: current_tile_id },
+                            ));
                         }
                     }
                 }
@@ -2639,31 +2653,16 @@ fn decode_tile_blob(
         }
     }
 
-    let mut tiles: Vec<DecodedTile> = tile_ids.iter().map(|&id| DecodedTile::FromSave(id)).collect();
-
-    let oom_count_before = tiles.iter().filter(|t| matches!(t, DecodedTile::FromSave(id) if *id == out_of_map_id)).count();
-
-    if std::env::var("FACTORIO_NO_PROCEDURAL").is_err() && oom_count_before > 0 {
-        let mut terrain = FastTerrain::new(seed);
-        let chunk_tiles = terrain.compute_chunk(chunk_x, chunk_y);
-        for i in 0..(32 * 32) {
-            if let DecodedTile::FromSave(id) = tiles[i] {
-                if id == out_of_map_id {
-                    let tile_name = FastTerrain::tile_name(chunk_tiles[i]);
-                    tiles[i] = DecodedTile::Procedural(tile_name.to_string());
-                }
-            }
+    let chunk_tiles = terrain.compute_chunk(chunk_x, chunk_y);
+    let tiles: Vec<DecodedTile> = (0..1024).map(|i| {
+        if filled[i] {
+            DecodedTile::FromSave(tile_ids[i])
+        } else {
+            DecodedTile::Procedural(terrain.tile_name(chunk_tiles[i]).to_string())
         }
-    }
+    }).collect();
 
-    if pos != data.len() {
-        if std::env::var("FACTORIO_DEBUG").is_ok() {
-            eprintln!("[DEBUG] Tile blob has {} trailing bytes (consumed {}/{})",
-                data.len() - pos, pos, data.len());
-        }
-    }
-
-    Ok(tiles)
+    Ok((tiles, cross_chunk_fills))
 }
 
 /// Scan for tile data by finding "/T" markers and working backwards
@@ -2689,6 +2688,14 @@ fn scan_for_tiles(
 
     // Look up the out-of-map tile ID from prototype mappings
     let out_of_map_id = prototype_mappings.tile_id_by_name("out-of-map").unwrap_or(143);
+
+    let terrain = match TerrainGenerator::new(seed) {
+        Ok(gen) => gen,
+        Err(e) => {
+            eprintln!("Failed to create TerrainGenerator: {}", e);
+            return Vec::new();
+        }
+    };
 
     if debug {
         if let Some(positions) = chunk_positions {
@@ -2745,12 +2752,14 @@ fn scan_for_tiles(
 
     let total_chunks = tile_chunks.len();
 
+    // Cross-chunk fill map: positions pre-filled by previous chunks' large tiles
+    let mut cross_chunk_map: std::collections::HashMap<(i32, i32), Vec<(usize, u16)>> =
+        std::collections::HashMap::new();
+
     for (ordinal, (_chunk_start, chunk_index, tile_blob_len, tile_blob)) in tile_chunks.into_iter().enumerate() {
         blob_lens.push(tile_blob_len);
         blob_lens_by_idx.insert(chunk_index, tile_blob_len);
 
-        // File-ordinal (not C: chunk_index) corresponds to prelude array order.
-        // C: chunks are column-major: cx = ordinal/side - half, cy = ordinal%side - half
         let from_prelude = chunk_positions.and_then(|positions| {
             positions.get(ordinal)
         });
@@ -2771,7 +2780,6 @@ fn scan_for_tiles(
         let (chunk_x, chunk_y) = from_prelude
             .map(|chunk| chunk.position)
             .unwrap_or_else(|| {
-                // Column-major grid: x = ord / side, y = ord % side, centered on origin
                 let side = (total_chunks as f64).sqrt().ceil() as i32;
                 let half = side / 2;
                 ((ordinal as i32 / side) - half, (ordinal as i32 % side) - half)
@@ -2784,9 +2792,15 @@ fn scan_for_tiles(
             );
         }
 
+        let prefilled = cross_chunk_map.remove(&(chunk_x, chunk_y)).unwrap_or_default();
         let status = from_prelude.map(|chunk| chunk.status).unwrap_or(0);
-        match decode_tile_blob(tile_blob, chunk_x, chunk_y, seed, out_of_map_id) {
-        Ok(chunk_tiles) => {
+        match decode_tile_blob(tile_blob, chunk_x, chunk_y, out_of_map_id, &terrain, prototype_mappings, &prefilled) {
+        Ok((chunk_tiles, cross_fills)) => {
+            for ((target_cx, target_cy), fill) in cross_fills {
+                cross_chunk_map.entry((target_cx, target_cy))
+                    .or_default()
+                    .push((fill.local_idx, fill.tile_id));
+            }
             tiles_per_chunk.insert(chunk_index, chunk_tiles.len());
 
             max_chunk_index = max_chunk_index.max(chunk_index);

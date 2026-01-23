@@ -69,6 +69,10 @@ path = "src/bin/factorio_bot.rs"
 name = "factorio-daemon"
 path = "src/bin/factorio_daemon.rs"
 
+[[bin]]
+name = "tile-decode-test"
+path = "src/bin/tile_decode_test.rs"
+
 [features]
 default = []
 tui = ["ratatui", "crossterm", "unicode-width"]
