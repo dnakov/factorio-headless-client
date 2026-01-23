@@ -305,6 +305,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_col_ord, total_filled, 100.0 * total_col_ord as f64 / total_filled.max(1) as f64,
         inner_col_ord, inner_filled, 100.0 * inner_col_ord as f64 / inner_filled.max(1) as f64);
 
+    // === Mismatch breakdown ===
+    println!("\n=== Mismatch breakdown (save -> procedural) ===");
+    let mut mismatch_pairs: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    let mut per_chunk_rates: Vec<(i32, i32, usize, usize)> = Vec::new();
+    {
+        let mut cross_map3: std::collections::HashMap<(i32, i32), Vec<(usize, u16)>> = std::collections::HashMap::new();
+        for (ordinal, (_, _, blob)) in blobs.iter().enumerate() {
+            let (chunk_x, chunk_y) = chunk_positions.get(ordinal).copied().unwrap_or((0, 0));
+            let prefilled = cross_map3.remove(&(chunk_x, chunk_y)).unwrap_or_default();
+            let (ids, filled, cross_fills) = decode_blob_with_prefill(blob, out_of_map_id, mappings, &prefilled, chunk_x, chunk_y);
+            for ((tcx, tcy), idx, tid) in cross_fills {
+                cross_map3.entry((tcx, tcy)).or_default().push((idx, tid));
+            }
+            if blob.len() >= 1039 { continue; } // inner only
+            let proc_tiles = terrain.compute_chunk(chunk_x, chunk_y);
+            let mut chunk_match = 0usize;
+            let mut chunk_filled = 0usize;
+            for i in 0..1024 {
+                if !filled[i] { continue; }
+                chunk_filled += 1;
+                let save_name = mappings.tile_name(ids[i]).map(|s| s.as_str()).unwrap_or("??");
+                let proc_name = terrain.tile_name(proc_tiles[i]);
+                if save_name == proc_name { chunk_match += 1; }
+                else { *mismatch_pairs.entry((save_name.to_string(), proc_name.to_string())).or_default() += 1; }
+            }
+            per_chunk_rates.push((chunk_x, chunk_y, chunk_match, chunk_filled));
+        }
+    }
+    let mut pairs: Vec<_> = mismatch_pairs.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    for ((save, proc), count) in pairs.iter().take(20) {
+        println!("  {:>20} -> {:<20} : {}", save, proc, count);
+    }
+    println!("\nWorst inner chunks:");
+    per_chunk_rates.sort_by(|a, b| {
+        let ra = a.2 as f64 / a.3.max(1) as f64;
+        let rb = b.2 as f64 / b.3.max(1) as f64;
+        ra.partial_cmp(&rb).unwrap()
+    });
+    for &(cx, cy, m, f) in per_chunk_rates.iter().take(10) {
+        println!("  ({:3},{:3}): {}/{} ({:.1}%)", cx, cy, m, f, 100.0 * m as f64 / f.max(1) as f64);
+    }
+
     // Show chunk (0,0) with cross-chunk fills for comparison
     let mut cross_map2: std::collections::HashMap<(i32, i32), Vec<(usize, u16)>> = std::collections::HashMap::new();
     for (ordinal, (_, _, blob)) in blobs.iter().enumerate() {

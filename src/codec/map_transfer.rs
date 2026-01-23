@@ -2063,6 +2063,7 @@ struct LevelDatStream {
     seed: u32,
     map_width: u32,
     map_height: u32,
+    autoplace_controls: HashMap<String, FrequencySizeRichness>,
     prototype_mappings: PrototypeMappings,
     end_position: usize,
 }
@@ -2341,6 +2342,7 @@ impl LevelDatStream {
             seed: map_gen_settings.seed,
             map_width: map_gen_settings.width,
             map_height: map_gen_settings.height,
+            autoplace_controls: map_gen_settings.autoplace_controls,
             prototype_mappings,
             end_position,
         })
@@ -2509,6 +2511,7 @@ impl LevelDatStream {
             seed: map_gen_settings.seed,
             map_width: map_gen_settings.width,
             map_height: map_gen_settings.height,
+            autoplace_controls: map_gen_settings.autoplace_controls,
             prototype_mappings,
             end_position,
         })
@@ -2671,6 +2674,7 @@ fn scan_for_tiles(
     prototype_mappings: &PrototypeMappings,
     chunk_positions: Option<&Vec<ChunkPrelude>>,
     seed: u32,
+    autoplace_controls: &HashMap<String, FrequencySizeRichness>,
 ) -> Vec<MapTile> {
     let debug = std::env::var("FACTORIO_DEBUG").is_ok();
     let mut all_tiles = Vec::new();
@@ -2689,7 +2693,14 @@ fn scan_for_tiles(
     // Look up the out-of-map tile ID from prototype mappings
     let out_of_map_id = prototype_mappings.tile_id_by_name("out-of-map").unwrap_or(143);
 
-    let terrain = match TerrainGenerator::new(seed) {
+    // Convert autoplace_controls to compiler control variable format
+    let mut controls = HashMap::new();
+    for (name, fsr) in autoplace_controls {
+        controls.insert(format!("control:{}:frequency", name), fsr.frequency);
+        controls.insert(format!("control:{}:size", name), fsr.size);
+    }
+
+    let terrain = match TerrainGenerator::new_with_controls(seed, &controls) {
         Ok(gen) => gen,
         Err(e) => {
             eprintln!("Failed to create TerrainGenerator: {}", e);
@@ -2939,6 +2950,7 @@ fn parse_zip_map(data: &[u8]) -> Result<MapData> {
         &stream.prototype_mappings,
         first_surface_positions,
         seed,
+        &stream.autoplace_controls,
     );
 
     // Discard tiles outside the known map bounds

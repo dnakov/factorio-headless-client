@@ -232,6 +232,11 @@ impl Compiler {
         }
     }
 
+    /// Override a control default value (e.g. "control:water:frequency" -> 0.5)
+    pub fn set_control(&mut self, name: &str, value: f32) {
+        self.control_defaults.insert(name.to_string(), value);
+    }
+
     /// Set a point list (like starting_lake_positions)
     pub fn set_point_list(&mut self, name: &str, points: Vec<(f32, f32)>) {
         self.point_lists.insert(name.to_string(), points);

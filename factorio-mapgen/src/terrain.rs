@@ -26,15 +26,21 @@ pub struct TerrainGenerator {
     tile_names: Vec<String>,
     moisture_bias: f32,
     aux_bias: f32,
+    controls: std::collections::HashMap<String, f32>,
 }
 
 impl TerrainGenerator {
     /// Create a new terrain generator, loading from Factorio's data files
     pub fn new(seed: u32) -> Result<Self, String> {
+        Self::new_with_controls(seed, &std::collections::HashMap::new())
+    }
+
+    /// Create a new terrain generator with map gen control overrides
+    pub fn new_with_controls(seed: u32, controls: &std::collections::HashMap<String, f32>) -> Result<Self, String> {
         let factorio_path = Path::new("/Applications/factorio.app/Contents/data");
 
         if factorio_path.exists() {
-            Self::from_factorio(seed, factorio_path)
+            Self::from_factorio_with_controls(seed, factorio_path, controls)
         } else {
             Err("Factorio not found at /Applications/factorio.app/Contents/data".to_string())
         }
@@ -42,12 +48,21 @@ impl TerrainGenerator {
 
     /// Create from Factorio's actual Lua files
     pub fn from_factorio(seed: u32, factorio_path: &Path) -> Result<Self, String> {
+        Self::from_factorio_with_controls(seed, factorio_path, &std::collections::HashMap::new())
+    }
+
+    /// Create from Factorio's actual Lua files with map gen control overrides
+    pub fn from_factorio_with_controls(seed: u32, factorio_path: &Path, controls: &std::collections::HashMap<String, f32>) -> Result<Self, String> {
         let data = FactorioData::load_with_seed(factorio_path, seed)?;
 
+        let controls_owned = controls.clone();
 
         // Build a compiler helper with all functions loaded
         let build_compiler = |data: &FactorioData| -> Compiler {
             let mut c = Compiler::new();
+            for (name, &value) in &controls_owned {
+                c.set_control(name, value);
+            }
 
             // Set point lists for distance_from_nearest_point
             c.set_point_list("starting_lake_positions", data.starting_lake_positions.clone());
@@ -142,6 +157,7 @@ impl TerrainGenerator {
             tile_names,
             moisture_bias: 0.0,
             aux_bias: 0.0,
+            controls: controls_owned,
         })
     }
 

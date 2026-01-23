@@ -15,7 +15,11 @@ src/
     types.rs          # Fixed32, MapPosition, etc.
     input_action.rs   # Player input actions (walk, mine, craft, etc.)
     map_transfer.rs   # Map save file parsing
+    map_settings.rs   # Map configuration parsing
+    map_types.rs      # Map data structures
     heartbeat.rs      # Server heartbeat packets
+    synchronizer_action.rs  # Synchronization actions
+    tick_closure.rs   # Tick execution closure
   protocol/           # Network protocol
     mod.rs
     packet.rs         # Packet header parsing, message types
@@ -40,29 +44,91 @@ src/
     session.rs        # Game session management
     commands.rs       # Command interface
     events.rs         # Event types
+  daemon/             # Background daemon service
+    mod.rs
+    protocol.rs       # Daemon protocol
   bot/                # Bot automation
     mod.rs
     controller.rs     # Movement/action controller
     crafting.rs       # Auto-crafting logic
-  bin/                # Debug/analysis binaries
+  lua/                # Lua integration
+    mod.rs
+    noise.rs          # Noise generation bindings
+    prototype.rs      # Prototype definitions
+    runtime.rs        # Lua runtime management
+  bin/                # Executables
+    play_game.rs      # Main game client
+    factorio_bot.rs   # Bot automation client
+    factorio_daemon.rs # Background daemon
+    tui.rs            # Terminal UI (requires --features tui)
+    tile_decode_test.rs # Tile format testing
+    download_map.rs   # Map download tool
+    check_map_seed.rs # Map seed verification
+
+factorio-mapgen/      # Workspace member: map generation library
+  src/
+    lib.rs
+    cache.rs          # Caching layer
+    compiler.rs       # Map generator compiler
+    executor.rs       # Execution engine
+    expression.rs     # Expression evaluation
+    loader.rs         # Data loader
+    operations.rs     # Map generation operations
+    program.rs        # Program representation
+    terrain.rs        # Terrain generation
+
+lua/                  # Factorio game data (base/, core/, space-age/, etc.)
+docs/                 # Protocol analysis and reverse engineering notes
 ```
 
 ## Running
 
 ```bash
-# Main game client
 cargo run --bin play-game
-
-# TUI interface (requires --features tui)
+cargo run --bin factorio-bot
+cargo run --bin factorio-daemon
+cargo run --bin tile-decode-test
 cargo run --bin factorio-tui --features tui
-
-# Test entity parsing
-cargo run --bin test-parsing
 ```
 
 ## Code Quality
 
 Run `kiss check` after writing code and fix any violations. Use `kiss rules` to see current thresholds.
+
+## External Tools
+
+### Radare2 (Binary Analysis)
+
+A radare2 instance is running with the Factorio binary loaded, accessible via HTTP:
+
+```
+http://localhost:9090/cmd/<url-encoded-command>
+```
+
+Example usage from code or scripts:
+```bash
+# Disassemble a function
+curl 'http://localhost:9090/cmd/pdf%20@%20sym.some_function'
+
+# Search for string references
+curl 'http://localhost:9090/cmd/iz~some_string'
+
+# Analyze function at address
+curl 'http://localhost:9090/cmd/af%20@%200x12345'
+
+# List functions matching pattern
+curl 'http://localhost:9090/cmd/afl~pattern'
+```
+
+Use this for disassembly, symbol lookup, string searches, and cross-references when reverse engineering packet formats or game internals.
+
+### RCON (Factorio Server)
+
+A Factorio server is running with RCON enabled:
+- Host: `localhost`
+- RCON password: `factorio123`
+
+Use RCON to execute console commands on the live server for testing and validation (e.g. teleport player, spawn entities, read game state via Lua commands).
 
 ## Protocol Overview
 
@@ -189,70 +255,21 @@ To count resources: scan for u16 IDs 135-139 in level.dat1+ files. Positions are
 ### 1. Capture Packets
 
 ```bash
-# Save raw packets during connection
 cargo run --bin capture-all-packets
-
-# Analyze captured data
 cargo run --bin analyze-captured
 ```
 
 ### 2. Save Map for Offline Analysis
 
 ```bash
-# Connect and save map.zip
 cargo run --bin save-map
-
-# Analyze offline
 cargo run --bin analyze-offline
 cargo run --bin test-parsing
 ```
 
 ### 3. Find Unknown Data Patterns
 
-Create a debug binary in `src/bin/`:
-
-```rust
-//! Investigation tool for [thing]
-use std::fs::File;
-use std::io::Read;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = File::open("captured_map.zip")?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-
-    let cursor = std::io::Cursor::new(&data);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-
-    // Decompress level.dat files
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
-        if name.contains("level.dat") {
-            let mut compressed = Vec::new();
-            entry.read_to_end(&mut compressed)?;
-            let decompressed = decompress(&compressed);
-            // Analyze decompressed...
-        }
-    }
-    Ok(())
-}
-
-fn decompress(data: &[u8]) -> Vec<u8> {
-    use flate2::read::ZlibDecoder;
-    let mut decoder = ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).unwrap_or_default();
-    out
-}
-```
-
-Add to Cargo.toml:
-```toml
-[[bin]]
-name = "my-investigation"
-path = "src/bin/my_investigation.rs"
-```
+Create a debug binary in `src/bin/`, add `[[bin]]` entry to Cargo.toml.
 
 ### 4. Pattern Searching
 
@@ -267,31 +284,14 @@ Look for:
 Compare against known data:
 - Connect to game, note player position
 - Save map, search for that position in binary
-- Use Python for quick prototyping:
-
-```python
-import zipfile, zlib, struct
-
-with zipfile.ZipFile('captured_map.zip') as zf:
-    for name in zf.namelist():
-        if 'level.dat' in name:
-            data = zlib.decompress(zf.read(name))
-            # Search for patterns...
-```
+- Use RCON to query live game state for comparison
 
 ## Common Pitfalls
 
-1. **False positives in entity scanning**: Random bytes match `[u16][i32][i32]` pattern. Filter by:
-   - Known entity ID range
-   - Position sanity (not 0,0, within map bounds)
-   - Avoid 65536-aligned positions
-
-2. **Resources vs entities**: Resources are tile data, not entity records. Don't try to parse them with entity format.
-
-3. **Multiple ID occurrences**: Same prototype name may appear multiple times in level.dat0 with different IDs. Find the correct section by locating known patterns like "tree-01".
-
+1. **False positives in entity scanning**: Random bytes match `[u16][i32][i32]` pattern. Filter by known entity ID range, position sanity, avoid 65536-aligned positions.
+2. **Resources vs entities**: Resources are tile data, not entity records.
+3. **Multiple ID occurrences**: Same prototype name may appear multiple times in level.dat0 with different IDs.
 4. **Zlib everywhere**: Most data is zlib-compressed. Always try decompression first.
-
 5. **Chunk structure**: Chunks are 32x32 tiles. Entity positions may be relative to chunk origin.
 
 ## Input Actions
@@ -311,18 +311,6 @@ Build packet:
 ```
 [action_type: u8] [tick: u32 LE] [player_id: u16 LE] [action_data...]
 ```
-
-## Useful Debug Binaries
-
-| Binary | Purpose |
-|--------|---------|
-| `test-parsing` | Verify entity/resource parsing |
-| `debug-entities` | Dump entity details |
-| `analyze-offline` | Offline map analysis |
-| `save-map` | Save map during connection |
-| `capture-all-packets` | Raw packet capture |
-| `decode-chunks` | Analyze chunk format |
-| `resource-tiles` | Resource storage investigation |
 
 ## Adding New Features
 
