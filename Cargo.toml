@@ -77,9 +77,23 @@ path = "src/bin/tile_decode_test.rs"
 name = "entity-debug"
 path = "src/bin/entity_debug.rs"
 
+[[bin]]
+name = "download-map"
+path = "src/bin/download_map.rs"
+
 [features]
 default = []
-tui = ["ratatui", "crossterm", "unicode-width"]
+tui = ["ratatui", "crossterm", "unicode-width", "ratatui-image", "image"]
+
+[dependencies.ratatui-image]
+version = "4.2"
+optional = true
+
+[dependencies.image]
+version = "0.25"
+optional = true
+default-features = false
+features = ["png"]
 
 [dependencies.ratatui]
 version = "0.29"
@@ -92,3 +106,12 @@ optional = true
 [dependencies.unicode-width]
 version = "0.2"
 optional = true
+
+
+[[bin]]
+name = "dump-chunk2"
+path = "src/bin/dump_chunk2.rs"
+
+[[bin]]
+name = "trace-entity"
+path = "src/bin/trace_entity.rs"

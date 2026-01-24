@@ -18,7 +18,7 @@ pub use input_action::{
     ShootingState, RidingAcceleration, RidingDirection,
     MouseButton, SwitchState, AdminActionType,
 };
-pub use map_types::{MapEntity, MapTile, MapVersion, SurfaceData, ChunkData, EntityData, TileData, DecorativeData};
+pub use map_types::{MapEntity, MapTile, MapVersion, SurfaceData, ChunkData, EntityData, TileData, DecorativeData, check_player_collision};
 pub use map_transfer::{
     MapTransfer, MapData,
     PrototypeMappings,

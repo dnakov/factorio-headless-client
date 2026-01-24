@@ -2674,6 +2674,7 @@ fn decode_tile_blob(
 fn scan_for_entities(
     data: &[u8],
     entity_prototypes: &HashMap<u16, String>,
+    entity_groups: &HashMap<u16, String>,
     chunk_positions: Option<&Vec<ChunkPrelude>>,
 ) -> Vec<MapEntity> {
     let debug = std::env::var("FACTORIO_DEBUG").is_ok();
@@ -2726,6 +2727,7 @@ fn scan_for_entities(
             chunk_x,
             chunk_y,
             entity_prototypes,
+            entity_groups,
         );
 
         if parsed.is_empty() {
@@ -2733,11 +2735,17 @@ fn scan_for_entities(
         } else {
             chunks_parsed += 1;
             for result in parsed {
+                let (cbox, collides) = entity_collision_box(&result.name);
                 all_entities.push(MapEntity {
                     name: result.name,
                     x: result.position.0 as f64 / 256.0,
                     y: result.position.1 as f64 / 256.0,
                     direction: 0,
+                    col_x1: cbox[0],
+                    col_y1: cbox[1],
+                    col_x2: cbox[2],
+                    col_y2: cbox[3],
+                    collides_player: collides,
                 });
             }
         }
@@ -3032,6 +3040,7 @@ fn parse_zip_map(data: &[u8]) -> Result<MapData> {
     let entities = scan_for_entities(
         &full_stream,
         &entity_prototypes,
+        &stream.prototype_mappings.entity_groups,
         first_surface_positions,
     );
     let mut tiles = scan_for_tiles(
@@ -3196,7 +3205,7 @@ impl MapData {
     }
 }
 
-use super::map_types::{MapEntity, MapTile, MapVersion};
+use super::map_types::{MapEntity, MapTile, MapVersion, entity_collision_box};
 
 #[cfg(test)]
 mod tests {

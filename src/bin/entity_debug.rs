@@ -37,16 +37,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (full_stream, dat_offsets) = load_full_stream_with_offsets(&data)?;
     let entity_protos = map_data.prototype_mappings.tables.get("Entity")
         .cloned().unwrap_or_default();
+    let entity_groups = &map_data.prototype_mappings.entity_groups;
     println!("Entity prototypes found: {}", entity_protos.len());
     println!("level.dat file offsets in stream:");
     for (idx, offset, len) in &dat_offsets {
         println!("  level.dat{}: offset={} len={}", idx, offset, len);
     }
-    // Print some key proto IDs
-    for id in [147u16, 215, 219, 224, 228, 230, 247, 756, 758] {
-        if let Some(name) = entity_protos.get(&id) {
-            println!("  proto {} = {}", id, name);
-        }
+    // Print groups present in map
+    let mut groups_seen: HashMap<&str, usize> = HashMap::new();
+    for (id, _) in &entity_protos {
+        let group = entity_groups.get(id).map(|s| s.as_str()).unwrap_or("NO GROUP");
+        *groups_seen.entry(group).or_default() += 1;
+    }
+    let mut group_list: Vec<_> = groups_seen.iter().collect();
+    group_list.sort_by(|a, b| b.1.cmp(a.1));
+    println!("Entity groups:");
+    for (group, count) in group_list.iter().take(30) {
+        println!("  {:40} {} protos", group, count);
     }
 
     // Find chunk boundaries
@@ -80,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (i, chunk) in chunks.iter().enumerate() {
         let entity_data = &full_stream[chunk.entity_start..chunk.entity_end];
-        let parsed = parse_chunk_entities(entity_data, chunk.x, chunk.y, &entity_protos);
+        let parsed = parse_chunk_entities(entity_data, chunk.x, chunk.y, &entity_protos, entity_groups);
 
         let detail = ChunkDebug {
             index: i,
@@ -180,6 +187,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let entity_data = &full_stream[chunks[detail.index].entity_start..chunks[detail.index].entity_end];
         println!("chunk({},{}) section={} bytes, parsed {} entities", detail.x, detail.y, entity_data.len(), detail.entities_parsed);
         dump_hex_annotated(entity_data, detail.x, detail.y, &entity_protos);
+    }
+
+    // Dump bytes for container entity chunks
+    println!("\n=== Container entity bytes ===");
+    for detail in &per_chunk_details {
+        if detail.entities_parsed > 0 {
+            let first = detail.first_entity.as_deref().unwrap_or("");
+            if first.contains("crash-site") || first.contains("container") {
+                let entity_data = &full_stream[chunks[detail.index].entity_start..chunks[detail.index].entity_end];
+                println!("chunk({},{}) section={} bytes, parsed={}", detail.x, detail.y, entity_data.len(), detail.entities_parsed);
+                // Show first 200 bytes after pre-entity sections
+                let mut r = BinaryReader::new(entity_data);
+                let _ = factorio_client::codec::entity_parsers::skip_pre_entity_sections(&mut r);
+                let start = r.position();
+                let end = (start + 200).min(entity_data.len());
+                for row in 0..((end - start + 15) / 16) {
+                    let s = start + row * 16;
+                    let e = (s + 16).min(end);
+                    print!("  {:4}: ", s);
+                    for i in s..e { print!("{:02x} ", entity_data[i]); }
+                    println!();
+                }
+            }
+        }
     }
 
     // Identify which entity types cause parsing to stop

@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::codec::{
     BinaryReader, BinaryWriter, Direction, InputAction as CodecInputAction, InputActionType,
     MapEntity, MapPosition, ShootingState, SynchronizerActionType, parse_map_data,
-    map_transfer::MapData,
+    check_player_collision, map_transfer::MapData,
 };
 use crate::error::{Error, Result};
 use crate::protocol::message::{
@@ -1960,23 +1960,28 @@ impl Connection {
             return;
         }
 
-        // Character walking speed from prototype data (tiles per tick)
         let speed = self.character_speed;
         let distance = ticks_elapsed as f64 * speed;
 
-        // Update position based on direction
-        // Directions: 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW
         let diag = 0.7071; // 1/sqrt(2)
-        match self.walking_direction {
-            0 => self.player_y -= distance,                                    // North
-            1 => { self.player_x += distance * diag; self.player_y -= distance * diag; } // NE
-            2 => self.player_x += distance,                                    // East
-            3 => { self.player_x += distance * diag; self.player_y += distance * diag; } // SE
-            4 => self.player_y += distance,                                    // South
-            5 => { self.player_x -= distance * diag; self.player_y += distance * diag; } // SW
-            6 => self.player_x -= distance,                                    // West
-            7 => { self.player_x -= distance * diag; self.player_y -= distance * diag; } // NW
-            _ => {}
+        let (dx, dy) = match self.walking_direction {
+            0 => (0.0, -distance),
+            1 => (distance * diag, -distance * diag),
+            2 => (distance, 0.0),
+            3 => (distance * diag, distance * diag),
+            4 => (0.0, distance),
+            5 => (-distance * diag, distance * diag),
+            6 => (-distance, 0.0),
+            7 => (-distance * diag, -distance * diag),
+            _ => (0.0, 0.0),
+        };
+
+        let new_x = self.player_x + dx;
+        let new_y = self.player_y + dy;
+
+        if !check_player_collision(&self.entities, new_x, new_y) {
+            self.player_x = new_x;
+            self.player_y = new_y;
         }
 
         self.last_position_tick = self.server_tick;

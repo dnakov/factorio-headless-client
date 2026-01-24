@@ -37,8 +37,10 @@ mod tui_main {
     use std::collections::HashMap;
     use std::io::stdout;
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage, Resize};
 
     use crossterm::{
         event::{self, Event, KeyCode, KeyEventKind},
@@ -50,12 +52,140 @@ mod tui_main {
         widgets::{Block, Borders, Paragraph},
     };
 
-    use factorio_client::codec::{MapEntity, MapTile, parse_map_data};
+    use factorio_client::codec::{MapEntity, MapTile, parse_map_data, check_player_collision};
     use factorio_client::noise::terrain::TerrainGenerator;
     use factorio_client::protocol::{Connection, PlayerState};
 
     const ZOOM_LEVELS: [f64; 11] = [0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
     const DEFAULT_ZOOM_IDX: usize = 5; // 1.0x
+    const Y_STRETCH: f64 = 1.1; // compensate for terminal cells being taller than wide
+    const FACTORIO_DATA_PATH: &str = "/Applications/factorio.app/Contents/data";
+
+    struct EntityIcons {
+        picker: Picker,
+        icon_paths: HashMap<String, PathBuf>,
+        images: HashMap<String, image::DynamicImage>,
+        protocols: HashMap<String, StatefulProtocol>,
+        last_zoom: f64,
+        no_icon: HashMap<String, ()>,
+    }
+
+    impl EntityIcons {
+        fn new(picker: Picker) -> Self {
+            Self {
+                picker,
+                icon_paths: HashMap::new(),
+                images: HashMap::new(),
+                protocols: HashMap::new(),
+                last_zoom: 0.0,
+                no_icon: HashMap::new(),
+            }
+        }
+
+        /// Scan entity Lua files to build name -> icon path mapping
+        fn load_icon_paths(&mut self, factorio_path: &Path) {
+            let proto_dir = factorio_path.join("base/prototypes");
+            let lua_files = [
+                "entity/entities.lua", "entity/transport-belts.lua", "entity/enemies.lua",
+                "entity/trees.lua", "entity/turrets.lua", "entity/trains.lua",
+                "entity/resources.lua", "entity/mining-drill.lua", "entity/flying-robots.lua",
+                "decorative/decoratives.lua",
+            ];
+
+            for filename in &lua_files {
+                let path = proto_dir.join(filename);
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    self.parse_lua_icons(&content, factorio_path);
+                }
+            }
+        }
+
+        fn parse_lua_icons(&mut self, content: &str, factorio_path: &Path) {
+            let mut current_name: Option<String> = None;
+
+            for line in content.lines() {
+                let trimmed = line.trim();
+
+                if let Some(name) = extract_lua_string(trimmed, "name") {
+                    current_name = Some(name);
+                }
+
+                if let Some(icon_path) = extract_lua_string(trimmed, "icon") {
+                    if let Some(ref name) = current_name {
+                        if let Some(resolved) = resolve_factorio_path(&icon_path, factorio_path) {
+                            if resolved.exists() {
+                                self.icon_paths.insert(name.clone(), resolved);
+                            }
+                        }
+                    }
+                }
+
+                if trimmed == "}," || trimmed == "}" {
+                    current_name = None;
+                }
+            }
+        }
+
+        fn get_image(&mut self, entity_name: &str) -> Option<&image::DynamicImage> {
+            if self.no_icon.contains_key(entity_name) {
+                return None;
+            }
+            if !self.images.contains_key(entity_name) {
+                let path = self.icon_paths.get(entity_name).cloned().or_else(|| {
+                    let fallback = Path::new(FACTORIO_DATA_PATH)
+                        .join("base/graphics/icons")
+                        .join(format!("{}.png", entity_name));
+                    if fallback.exists() { Some(fallback) } else { None }
+                });
+                let path = match path {
+                    Some(p) => p,
+                    None => {
+                        self.no_icon.insert(entity_name.to_string(), ());
+                        return None;
+                    }
+                };
+                match image::open(&path) {
+                    Ok(mut img) => {
+                        // Icons are mipmap strips (64+32+16+8 = 120 wide, 64 tall)
+                        // Crop to just the first 64x64 icon
+                        let icon = if img.width() > 64 && img.height() >= 64 {
+                            img.crop(0, 0, 64, 64)
+                        } else {
+                            img
+                        };
+                        self.images.insert(entity_name.to_string(), icon);
+                    }
+                    Err(_) => {
+                        self.no_icon.insert(entity_name.to_string(), ());
+                        return None;
+                    }
+                };
+            }
+            self.images.get(entity_name)
+        }
+    }
+
+    fn extract_lua_string(line: &str, field: &str) -> Option<String> {
+        let pattern = format!("{} = \"", field);
+        let pos = line.find(&pattern)?;
+        if pos > 0 && (line.as_bytes()[pos - 1].is_ascii_alphanumeric() || line.as_bytes()[pos - 1] == b'_') {
+            return None;
+        }
+        let start = pos + pattern.len();
+        let rest = &line[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+
+    fn resolve_factorio_path(lua_path: &str, factorio_path: &Path) -> Option<PathBuf> {
+        if let Some(rest) = lua_path.strip_prefix("__base__/") {
+            Some(factorio_path.join("base").join(rest))
+        } else if let Some(rest) = lua_path.strip_prefix("__core__/") {
+            Some(factorio_path.join("core").join(rest))
+        } else {
+            None
+        }
+    }
 
     struct App {
         server_addr: SocketAddr,
@@ -175,14 +305,16 @@ mod tui_main {
         fn cursor_world_pos(&self) -> (f64, f64) {
             let z = self.zoom();
             (self.player_x + self.cursor_dx as f64 / z,
-             self.player_y + self.cursor_dy as f64 / z)
+             self.player_y + self.cursor_dy as f64 * Y_STRETCH / z)
         }
 
         fn entity_at_cursor(&self) -> Option<&MapEntity> {
             let (cx, cy) = self.cursor_world_pos();
-            let radius = 0.5 / self.zoom().max(1.0);
             self.entities.iter().find(|e| {
-                (e.x - cx).abs() < radius && (e.y - cy).abs() < radius
+                let half_w = e.tile_width() / 2.0;
+                let half_h = e.tile_height() / 2.0;
+                cx >= e.x - half_w && cx < e.x + half_w
+                    && cy >= e.y - half_h && cy < e.y + half_h
             })
         }
 
@@ -304,6 +436,17 @@ mod tui_main {
 
         let rt = tokio::runtime::Runtime::new()?;
 
+        // Query terminal for graphics protocol support + font size (before raw mode)
+        let picker = Picker::from_query_stdio().ok();
+        let entity_icons: RefCell<Option<EntityIcons>> = RefCell::new(picker.map(|p| {
+            let mut icons = EntityIcons::new(p);
+            let factorio_path = Path::new(FACTORIO_DATA_PATH);
+            if factorio_path.exists() {
+                icons.load_icon_paths(factorio_path);
+            }
+            icons
+        }));
+
         enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
@@ -370,7 +513,7 @@ mod tui_main {
         let mut last_tick = Instant::now();
 
         loop {
-            terminal.draw(|frame| render(frame, &app))?;
+            terminal.draw(|frame| render(frame, &app, &entity_icons))?;
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
             if event::poll(timeout)? {
@@ -508,9 +651,12 @@ mod tui_main {
 
         if app.state == AppState::OfflineMap {
             let step = 1.0 / app.zoom();
-            app.player_x += dx as f64 * step;
-            app.player_y += dy as f64 * step;
-            // Clamp to map bounds if set
+            let new_x = app.player_x + dx as f64 * step;
+            let new_y = app.player_y + dy as f64 * step;
+            if !check_player_collision(&app.entities, new_x, new_y) {
+                app.player_x = new_x;
+                app.player_y = new_y;
+            }
             if let Some(bounds) = app.map_bounds {
                 app.player_x = app.player_x.clamp(-bounds, bounds);
                 app.player_y = app.player_y.clamp(-bounds, bounds);
@@ -709,7 +855,7 @@ mod tui_main {
         }
     }
 
-    fn render(frame: &mut Frame, app: &App) {
+    fn render(frame: &mut Frame, app: &App, entity_icons: &RefCell<Option<EntityIcons>>) {
         // Help overlay
         if app.show_help {
             render_help(frame);
@@ -729,7 +875,7 @@ mod tui_main {
             .split(area);
 
         render_header(frame, app, chunks[0]);
-        render_main(frame, app, chunks[1]);
+        render_main(frame, app, chunks[1], entity_icons);
         render_footer(frame, app, chunks[2]);
     }
 
@@ -821,20 +967,20 @@ mod tui_main {
         frame.render_widget(Paragraph::new(stats).block(stats_block), header_chunks[2]);
     }
 
-    fn render_main(frame: &mut Frame, app: &App, area: Rect) {
+    fn render_main(frame: &mut Frame, app: &App, area: Rect, entity_icons: &RefCell<Option<EntityIcons>>) {
         let main_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(40), Constraint::Length(28)])
             .split(area);
 
         // Map
-        render_map(frame, app, main_chunks[0]);
+        render_map(frame, app, main_chunks[0], entity_icons);
 
         // Side panel
         render_sidebar(frame, app, main_chunks[1]);
     }
 
-    fn render_map(frame: &mut Frame, app: &App, area: Rect) {
+    fn render_map(frame: &mut Frame, app: &App, area: Rect, entity_icons: &RefCell<Option<EntityIcons>>) {
         // Draw border
         let block = Block::default()
             .borders(Borders::ALL)
@@ -852,7 +998,9 @@ mod tui_main {
         // Use 2-char cells for consistent emoji rendering
         let cell_width = 2;
         let cols = width / cell_width;
+        let y_stretch = Y_STRETCH;
 
+        let has_image_renderer = entity_icons.borrow().is_some();
         let buf = frame.buffer_mut();
 
         for row in 0..height {
@@ -862,7 +1010,7 @@ mod tui_main {
 
                 // Map screen position to world position
                 let offset_x = (col - cols / 2) as f64 / zoom;
-                let offset_y = (row - height / 2) as f64 / zoom;
+                let offset_y = (row - height / 2) as f64 * y_stretch / zoom;
                 let world_x = app.player_x + offset_x;
                 let world_y = app.player_y + offset_y;
 
@@ -879,9 +1027,10 @@ mod tui_main {
                 // Find entity at this position (only if showing parsed map)
                 let entity = if app.show_parsed_map {
                     app.entities.iter().find(|e| {
-                        let dx = ((e.x - world_x) * zoom).round() as i32;
-                        let dy = ((e.y - world_y) * zoom).round() as i32;
-                        dx == 0 && dy == 0
+                        let half_w = e.tile_width() / 2.0;
+                        let half_h = e.tile_height() / 2.0;
+                        world_x >= e.x - half_w && world_x < e.x + half_w
+                            && world_y >= e.y - half_h && world_y < e.y + half_h
                     })
                 } else {
                     None
@@ -924,9 +1073,19 @@ mod tui_main {
                     // Out of bounds - show void
                     ("  ", Style::default().bg(Color::Black))
                 } else if let Some(ent) = entity {
-                    // Show entity (only when show_parsed_map is on)
-                    let (icon, color) = entity_icon(&ent.name);
-                    (icon, Style::default().fg(color))
+                    if has_image_renderer {
+                        // Image pass will render entity icons; show tile underneath
+                        if let Some(tile) = parsed_tile {
+                            ("  ", Style::default().bg(tile_color(&tile.name)))
+                        } else if let Some(name) = procedural_tile_name {
+                            ("  ", Style::default().bg(tile_color(name)))
+                        } else {
+                            ("  ", Style::default())
+                        }
+                    } else {
+                        let (icon, color) = entity_icon(&ent.name);
+                        (icon, Style::default().fg(color))
+                    }
                 } else if let Some(tile) = parsed_tile {
                     // Parsed tile overlays procedural terrain
                     let color = tile_color(&tile.name);
@@ -941,6 +1100,61 @@ mod tui_main {
                 };
 
                 buf.set_string(screen_x, screen_y, icon, style);
+            }
+        }
+
+        // Render entity images using kitty/sixel protocol
+        if app.show_parsed_map {
+            let mut icons_ref = entity_icons.borrow_mut();
+            if let Some(ref mut icons) = *icons_ref {
+                // Clear protocol cache when zoom changes
+                if icons.last_zoom != zoom {
+                    icons.protocols.clear();
+                    icons.last_zoom = zoom;
+                }
+
+                let mut to_render: Vec<(Rect, String)> = Vec::new();
+                for entity in &app.entities {
+                    let dx = entity.x - app.player_x;
+                    let dy = entity.y - app.player_y;
+                    let screen_col = (dx * zoom).round() as i32 + cols / 2;
+                    let screen_row = (dy * zoom / Y_STRETCH).round() as i32 + height / 2;
+                    let ew = (entity.tile_width() * zoom).round() as i32;
+                    let eh = (entity.tile_height() * zoom / Y_STRETCH).round() as i32;
+                    if ew < 1 || eh < 1 { continue; }
+                    let x0 = screen_col - ew / 2;
+                    let y0 = screen_row - eh / 2;
+                    if x0 < 0 || y0 < 0 || x0 + ew > cols || y0 + eh > height { continue; }
+                    let rect = Rect::new(
+                        base_x + (x0 * cell_width) as u16,
+                        base_y + y0 as u16,
+                        (ew * cell_width) as u16,
+                        eh as u16,
+                    );
+                    to_render.push((rect, entity.name.clone()));
+                }
+
+                // Ensure images and protocols exist for visible entity types
+                for (_, name) in &to_render {
+                    icons.get_image(name);
+                }
+                let needs_proto: Vec<String> = to_render.iter()
+                    .map(|(_, name)| name.clone())
+                    .filter(|name| !icons.protocols.contains_key(name) && icons.images.contains_key(name))
+                    .collect();
+                for name in needs_proto {
+                    let img = icons.images.get(&name).unwrap().clone();
+                    let proto = icons.picker.new_resize_protocol(img);
+                    icons.protocols.insert(name, proto);
+                }
+
+                // Render each entity using cached protocol
+                for (rect, name) in &to_render {
+                    if let Some(proto) = icons.protocols.get_mut(name) {
+                        let widget = StatefulImage::default().resize(Resize::Scale(None));
+                        frame.render_stateful_widget(widget, *rect, proto);
+                    }
+                }
             }
         }
     }

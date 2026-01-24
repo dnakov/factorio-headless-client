@@ -255,6 +255,43 @@ impl FactorioLua {
         "#).exec()
     }
 
+    pub fn load_base_entities(&self) -> LuaResult<()> {
+        self.lua.load(r#"
+            package.loaded["circuit-connector-sprites"] = {}
+            package.loaded["prototypes.entity.hit-effects"] = {}
+            package.loaded["prototypes.entity.pipecovers"] = {}
+            package.loaded["prototypes.entity.assemblerpipes"] = {}
+            package.loaded["prototypes.entity.laser-sounds"] = {}
+            package.loaded["prototypes.entity.character-animations"] = {}
+            package.loaded["prototypes.entity.spidertron-animations"] = {}
+            package.loaded["prototypes.entity.spawner-animation"] = {}
+            package.loaded["prototypes.entity.biter-animations"] = {}
+            package.loaded["prototypes.entity.spitter-animations"] = {}
+            package.loaded["prototypes.entity.worm-animations"] = {}
+            package.loaded["__base__/prototypes/planet/procession-graphic-catalogue-types"] = {}
+            package.loaded["__base__/prototypes/planet/procession-audio-catalogue-types"] = {}
+            package.loaded["__base__.prototypes.entity.cargo-pod-catalogue"] = {}
+        "#).exec()?;
+
+        let entity_files = [
+            "base/prototypes/entity/entities.lua",
+            "base/prototypes/entity/trees.lua",
+            "base/prototypes/entity/resources.lua",
+            "base/prototypes/entity/transport-belts.lua",
+            "base/prototypes/entity/mining-drill.lua",
+            "base/prototypes/entity/turrets.lua",
+            "base/prototypes/entity/crash-site.lua",
+            "base/prototypes/entity/enemies.lua",
+            "base/prototypes/entity/trains.lua",
+        ];
+        for file in entity_files {
+            if let Err(e) = self.load_prototype_file(file) {
+                eprintln!("[lua] skipping {}: {}", file, e);
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_base_recipes(&self) -> LuaResult<()> {
         self.load_prototype_file("base/prototypes/recipe.lua")
     }
