@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use crate::error::{Error, Result};
 use crate::protocol::packet::{PacketHeader, PacketBuilder, MessageType, MAX_PACKET_SIZE};
@@ -27,6 +29,19 @@ impl Transport {
     pub async fn new_with_bind(remote_addr: SocketAddr, bind_addr: SocketAddr) -> Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await
             .map_err(|e| Error::Io(e.to_string()))?;
+
+        // Set receive buffer to 4MB to handle burst TransferBlock responses
+        #[cfg(unix)]
+        unsafe {
+            let buf_size: libc::c_int = 4 * 1024 * 1024;
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
 
         Ok(Self {
             socket,
@@ -90,6 +105,19 @@ impl Transport {
         match tokio::time::timeout(timeout, self.recv()).await {
             Ok(result) => result.map(Some),
             Err(_) => Ok(None),
+        }
+    }
+
+    /// Try to receive raw bytes without blocking. Returns None if no data available.
+    pub fn try_recv_raw(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; MAX_PACKET_SIZE];
+        match self.socket.try_recv_from(&mut buf) {
+            Ok((len, _)) => {
+                buf.truncate(len);
+                Ok(Some(buf))
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(Error::Io(e.to_string())),
         }
     }
 

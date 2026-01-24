@@ -12,6 +12,8 @@ pub mod client;
 pub mod bot;
 pub mod daemon;
 pub mod lua;
+#[cfg(feature = "gpu")]
+pub mod renderer;
 pub use factorio_mapgen as noise;
 
 pub use error::{Error, Result};

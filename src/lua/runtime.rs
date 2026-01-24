@@ -35,9 +35,14 @@ impl FactorioLua {
             })?)?;
             globals.set("serpent", serpent)?;
 
-            // Create mods table (empty for data stage)
+            // Create mods table (include installed mod folders if present)
             let mods = lua.create_table()?;
             mods.set("base", "2.0.0")?;
+            for mod_name in ["space-age", "elevated-rails"] {
+                if factorio_path.join(mod_name).exists() {
+                    mods.set(mod_name, "2.0.0")?;
+                }
+            }
             globals.set("mods", mods)?;
 
             // Create defines table with all 16 direction constants
@@ -297,17 +302,17 @@ impl FactorioLua {
     }
 
     pub fn load_base_tiles(&self) -> LuaResult<()> {
-        // Tiles have dependencies on other systems, stub them
+        // Tiles have dependencies on sounds/graphics; stub the minimal helpers.
         self.lua.load(r#"
-            package.loaded["__base__.prototypes.tile.tile-sounds"] = {}
-            package.loaded["__base__.prototypes.tile.tile-transitions-between-transitions"] = {}
-            package.loaded["__base__.prototypes.tile.tile-transitions"] = {}
-            package.loaded["__base__.prototypes.tile.tile-graphics"] = { water_shallow_transitions = {} }
+            if not sound_variations then
+                function sound_variations(...) return {} end
+            end
+            if not default_tile_sounds_advanced_volume_control then
+                function default_tile_sounds_advanced_volume_control() return {} end
+            end
         "#).exec()?;
 
-        // Now we can't load tiles directly because they depend on too much graphics stuff
-        // Instead we'll provide tile data through a simpler mechanism
-        Ok(())
+        self.load_prototype_file("base/prototypes/tile/tiles.lua")
     }
 
     pub fn data_raw(&self) -> LuaResult<Table> {
@@ -322,6 +327,18 @@ impl FactorioLua {
 }
 
 fn resolve_module_path(factorio_path: &Path, modname: &str) -> Option<PathBuf> {
+    if let Some(stripped) = modname.strip_prefix("__") {
+        if let Some(idx) = stripped.find("__/") {
+            let mod_name = &stripped[..idx];
+            let rel = &stripped[(idx + 3)..];
+            return Some(factorio_path.join(mod_name).join(format!("{}.lua", rel)));
+        }
+        if let Some(idx) = stripped.find("__.") {
+            let mod_name = &stripped[..idx];
+            let rel = &stripped[(idx + 3)..].replace('.', "/");
+            return Some(factorio_path.join(mod_name).join(format!("{}.lua", rel)));
+        }
+    }
     // Handle __base__ prefix
     if modname.starts_with("__base__.") {
         let relative = modname.strip_prefix("__base__.").unwrap().replace('.', "/");

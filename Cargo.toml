@@ -83,7 +83,21 @@ path = "src/bin/download_map.rs"
 
 [features]
 default = []
-tui = ["ratatui", "crossterm", "unicode-width", "ratatui-image", "image"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:ratatui-image", "dep:image"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:image", "dep:crossterm"]
+
+[dependencies.wgpu]
+version = "24"
+optional = true
+
+[dependencies.pollster]
+version = "0.4"
+optional = true
+
+[dependencies.bytemuck]
+version = "1"
+optional = true
+features = ["derive"]
 
 [dependencies.ratatui-image]
 version = "4.2"
@@ -115,3 +129,8 @@ path = "src/bin/dump_chunk2.rs"
 [[bin]]
 name = "trace-entity"
 path = "src/bin/trace_entity.rs"
+
+[[bin]]
+name = "factorio-gpu"
+path = "src/bin/gpu_viewer.rs"
+required-features = ["gpu"]

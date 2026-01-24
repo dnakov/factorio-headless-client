@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tui_main {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::io::stdout;
+    use std::io::{stdout, Write};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -55,6 +55,17 @@ mod tui_main {
     use factorio_client::codec::{MapEntity, MapTile, parse_map_data, check_player_collision};
     use factorio_client::noise::terrain::TerrainGenerator;
     use factorio_client::protocol::{Connection, PlayerState};
+
+    #[cfg(feature = "gpu")]
+    use image::ImageEncoder;
+    #[cfg(feature = "gpu")]
+    use factorio_client::renderer::{
+        atlas::TextureAtlas,
+        camera::Camera2D,
+        gpu::GpuState,
+        sprites::{SpriteInstance, SpriteRenderer},
+        tilemap::{TileInstance, TilemapRenderer, tile_color as gpu_tile_color},
+    };
 
     const ZOOM_LEVELS: [f64; 11] = [0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
     const DEFAULT_ZOOM_IDX: usize = 5; // 1.0x
@@ -187,6 +198,155 @@ mod tui_main {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    struct GpuMapRenderer {
+        gpu: GpuState,
+        camera: Camera2D,
+        atlas: TextureAtlas,
+        tilemap: TilemapRenderer,
+        sprites: SpriteRenderer,
+        pixels: Vec<u8>,
+        png_buf: Vec<u8>,
+        pending_area: Option<Rect>,
+        last_cam_x: f64,
+        last_cam_y: f64,
+        last_cam_zoom: f64,
+        last_parsed: bool,
+        last_w: u32,
+        last_h: u32,
+    }
+
+    #[cfg(feature = "gpu")]
+    impl GpuMapRenderer {
+        fn new() -> Self {
+            let gpu = GpuState::new(800, 600);
+            let factorio_path = Path::new(FACTORIO_DATA_PATH);
+            let atlas = TextureAtlas::new(&gpu.device, &gpu.queue, factorio_path);
+            let tilemap = TilemapRenderer::new(&gpu.device, gpu.format, &gpu.camera_bind_group_layout);
+            let sprites = SpriteRenderer::new(&gpu.device, gpu.format, &gpu.camera_bind_group_layout, &atlas.bind_group_layout);
+            Self {
+                gpu, camera: Camera2D::new(), atlas, tilemap, sprites,
+                pixels: Vec::new(),
+                png_buf: Vec::new(),
+                pending_area: None,
+                last_cam_x: f64::NAN,
+                last_cam_y: f64::NAN,
+                last_cam_zoom: f64::NAN,
+                last_parsed: false,
+                last_w: 800,
+                last_h: 600,
+            }
+        }
+
+        fn render_frame(&mut self, app: &App, render_w: u32, render_h: u32, tiles_visible: f64) {
+            if render_w != self.last_w || render_h != self.last_h {
+                self.gpu.resize(render_w, render_h);
+            }
+            self.camera.target_x = app.player_x;
+            self.camera.target_y = app.player_y;
+            self.camera.target_zoom = tiles_visible;
+            self.camera.aspect = render_w as f32 / render_h as f32;
+            self.camera.update(0.15);
+            self.gpu.upload_camera(&self.camera.view_proj());
+
+            let (min_x, min_y, max_x, max_y) = self.camera.visible_bounds();
+            let tx0 = min_x.floor() as i32 - 1;
+            let ty0 = min_y.floor() as i32 - 1;
+            let tx1 = max_x.ceil() as i32 + 1;
+            let ty1 = max_y.ceil() as i32 + 1;
+
+            let mut tile_instances = Vec::with_capacity(((tx1 - tx0) * (ty1 - ty0)) as usize);
+            for ty in ty0..ty1 {
+                for tx in tx0..tx1 {
+                    let name: &str = if app.show_parsed_map {
+                        app.tile_index.get(&(tx, ty))
+                            .and_then(|&idx| app.tiles.get(idx))
+                            .filter(|t| !t.procedural)
+                            .map(|t| t.name.as_str())
+                            .unwrap_or_else(|| app.procedural_tile_at(tx, ty))
+                    } else {
+                        app.procedural_tile_at(tx, ty)
+                    };
+                    tile_instances.push(TileInstance {
+                        pos: [tx as f32, ty as f32],
+                        color: gpu_tile_color(name),
+                    });
+                }
+            }
+            self.tilemap.upload(&self.gpu.device, &self.gpu.queue, &tile_instances);
+
+            let mut sprite_instances: Vec<SpriteInstance> = Vec::new();
+            // Player marker
+            if let Some(uv) = self.atlas.get_uv("character") {
+                sprite_instances.push(SpriteInstance {
+                    pos: [app.player_x as f32, app.player_y as f32],
+                    size: [1.0, 1.0],
+                    uv_min: [uv[0], uv[1]],
+                    uv_max: [uv[2], uv[3]],
+                    rotation: 0.0,
+                    _pad: 0.0,
+                });
+            }
+            if app.show_parsed_map {
+                for ent in &app.entities {
+                    if ent.x < min_x - 2.0 || ent.x > max_x + 2.0
+                        || ent.y < min_y - 2.0 || ent.y > max_y + 2.0 { continue; }
+                    let uv = match self.atlas.get_uv(&ent.name) {
+                        Some(uv) => uv,
+                        None => continue,
+                    };
+                    sprite_instances.push(SpriteInstance {
+                        pos: [ent.x as f32, ent.y as f32],
+                        size: [ent.tile_width().max(1.0) as f32, ent.tile_height().max(1.0) as f32],
+                        uv_min: [uv[0], uv[1]],
+                        uv_max: [uv[2], uv[3]],
+                        rotation: ent.direction as f32 * std::f32::consts::FRAC_PI_4,
+                        _pad: 0.0,
+                    });
+                }
+            }
+            self.sprites.upload(&self.gpu.device, &self.gpu.queue, &sprite_instances);
+
+            let mut encoder = self.gpu.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.gpu.render_view(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.02, g: 0.02, b: 0.04, a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                self.tilemap.draw(&mut pass, &self.gpu.camera_bind_group);
+                self.sprites.draw(&mut pass, &self.gpu.camera_bind_group, &self.atlas.bind_group);
+            }
+            self.gpu.queue.submit(std::iter::once(encoder.finish()));
+            self.gpu.readback(&mut self.pixels);
+
+            self.png_buf.clear();
+            image::codecs::png::PngEncoder::new_with_quality(
+                &mut self.png_buf,
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::Sub,
+            ).write_image(&self.pixels, render_w, render_h, image::ExtendedColorType::Rgba8)
+                .ok();
+            self.last_cam_x = app.player_x;
+            self.last_cam_y = app.player_y;
+            self.last_cam_zoom = self.camera.target_zoom;
+            self.last_parsed = app.show_parsed_map;
+            self.last_w = render_w;
+            self.last_h = render_h;
+        }
+    }
+
     struct App {
         server_addr: SocketAddr,
         username: String,
@@ -237,6 +397,9 @@ mod tui_main {
         chat_mode: bool,
         show_help: bool,
         show_parsed_map: bool,
+
+        #[cfg(feature = "gpu")]
+        gpu_renderer: RefCell<Option<GpuMapRenderer>>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -288,6 +451,8 @@ mod tui_main {
                 chat_mode: false,
                 show_help: false,
                 show_parsed_map: true,
+                #[cfg(feature = "gpu")]
+                gpu_renderer: RefCell::new(None),
             }
         }
 
@@ -447,11 +612,16 @@ mod tui_main {
             icons
         }));
 
+        #[cfg(feature = "gpu")]
+        let gpu_init = Some(GpuMapRenderer::new());
+
         enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
         let mut app = App::new(server_addr, username);
+        #[cfg(feature = "gpu")]
+        { *app.gpu_renderer.borrow_mut() = gpu_init; }
 
         // Load offline map if specified
         if let Some(ref path) = offline_map {
@@ -514,6 +684,34 @@ mod tui_main {
 
         loop {
             terminal.draw(|frame| render(frame, &app, &entity_icons))?;
+
+            #[cfg(feature = "gpu")]
+            {
+                let gpu_ref = app.gpu_renderer.borrow();
+                if let Some(ref renderer) = *gpu_ref {
+                    if let Some(area) = renderer.pending_area {
+                        if !renderer.png_buf.is_empty() {
+                            let mut out = stdout();
+                            write!(out, "\x1b[{};{}H", area.y + 1, area.x + 1)?;
+                            let encoded = gpu_base64(&renderer.png_buf);
+                            let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
+                            for (i, chunk) in chunks.iter().enumerate() {
+                                let more = if i < chunks.len() - 1 { 1 } else { 0 };
+                                if i == 0 {
+                                    write!(out, "\x1b_Ga=T,f=100,s={},v={},c={},r={},m={};",
+                                        renderer.last_w, renderer.last_h,
+                                        area.width, area.height, more)?;
+                                } else {
+                                    write!(out, "\x1b_Gm={};", more)?;
+                                }
+                                out.write_all(chunk)?;
+                                write!(out, "\x1b\\")?;
+                            }
+                            out.flush()?;
+                        }
+                    }
+                }
+            }
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
             if event::poll(timeout)? {
@@ -989,6 +1187,38 @@ mod tui_main {
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
 
+        #[cfg(feature = "gpu")]
+        {
+            let mut gpu_ref = app.gpu_renderer.borrow_mut();
+            if let Some(renderer) = gpu_ref.as_mut() {
+                // Cells are ~2:1 (height:width in pixels), so pixel aspect of display area:
+                let pixel_aspect = inner_area.width as f32 / (inner_area.height.max(1) as f32 * 2.0);
+                let (render_w, render_h) = if pixel_aspect > 1.0 {
+                    (800, (800.0 / pixel_aspect) as u32)
+                } else {
+                    ((800.0 * pixel_aspect) as u32, 800)
+                };
+                if render_w >= 8 && render_h >= 8 {
+                    let tiles_visible = inner_area.height as f64 * Y_STRETCH / app.zoom();
+                    let animating = (renderer.camera.x - renderer.camera.target_x).abs() > 0.001
+                        || (renderer.camera.y - renderer.camera.target_y).abs() > 0.001
+                        || (renderer.camera.zoom - renderer.camera.target_zoom).abs() > 0.01;
+                    let dirty = animating
+                        || renderer.last_cam_x != app.player_x
+                        || renderer.last_cam_y != app.player_y
+                        || renderer.last_cam_zoom != tiles_visible
+                        || renderer.last_parsed != app.show_parsed_map
+                        || renderer.last_w != render_w
+                        || renderer.last_h != render_h;
+                    if dirty {
+                        renderer.render_frame(app, render_w, render_h, tiles_visible);
+                    }
+                    renderer.pending_area = Some(inner_area);
+                    return;
+                }
+            }
+        }
+
         let width = inner_area.width as i32;
         let height = inner_area.height as i32;
         let zoom = app.zoom();
@@ -1446,6 +1676,23 @@ mod tui_main {
             // Default - show ? with name hint
             _ => ("? ", Color::DarkGray),
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_base64(data: &[u8]) -> String {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::with_capacity((data.len() + 2) / 3 * 4);
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[((n >> 18) & 63) as usize]);
+            out.push(TABLE[((n >> 12) & 63) as usize]);
+            out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] } else { b'=' });
+            out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] } else { b'=' });
+        }
+        unsafe { String::from_utf8_unchecked(out) }
     }
 
     fn tile_color(name: &str) -> Color {

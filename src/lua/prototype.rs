@@ -55,21 +55,38 @@ pub struct TilePrototype {
 
 impl Prototypes {
     pub fn load(factorio_path: &Path) -> LuaResult<Self> {
-        let lua = FactorioLua::new(factorio_path)?;
-        lua.load_dataloader()?;
-        lua.load_util()?;
-        lua.load_base_items()?;
-        lua.load_base_entities()?;
+    let lua = FactorioLua::new(factorio_path)?;
+    lua.load_dataloader()?;
+    lua.load_util()?;
+    lua.load_base_items()?;
+    lua.load_base_entities()?;
+    if let Err(e) = lua.load_base_tiles() {
+        eprintln!("[lua] skipping base tiles: {}", e);
+    }
+    if factorio_path.join("space-age").exists() {
+        let space_age_tiles = [
+            "space-age/prototypes/tile/tiles.lua",
+            "space-age/prototypes/tile/tiles-aquilo.lua",
+            "space-age/prototypes/tile/tiles-fulgora.lua",
+            "space-age/prototypes/tile/tiles-gleba.lua",
+            "space-age/prototypes/tile/tiles-vulcanus.lua",
+        ];
+        for file in space_age_tiles {
+            if let Err(e) = lua.load_prototype_file(file) {
+                eprintln!("[lua] skipping {}: {}", file, e);
+            }
+        }
+    }
 
         let data_raw = lua.data_raw()?;
 
-        let items = extract_items(&data_raw)?;
-        let entities = extract_entities(&data_raw)?;
-        let recipes = HashMap::new();
-        let tiles = HashMap::new();
+    let items = extract_items(&data_raw)?;
+    let entities = extract_entities(&data_raw)?;
+    let tiles = extract_tiles(&data_raw)?;
+    let recipes = HashMap::new();
 
-        Ok(Self { items, recipes, tiles, entities })
-    }
+    Ok(Self { items, recipes, tiles, entities })
+}
 
     pub fn global() -> Option<&'static Prototypes> {
         PROTOTYPES.get()
@@ -193,6 +210,34 @@ fn extract_entities(data_raw: &Table) -> LuaResult<HashMap<String, EntityPrototy
     Ok(entities)
 }
 
+fn extract_tiles(data_raw: &Table) -> LuaResult<HashMap<String, TilePrototype>> {
+    let mut tiles = HashMap::new();
+    let tile_table: Table = match data_raw.get("tile") {
+        Ok(t) => t,
+        Err(_) => return Ok(tiles),
+    };
+
+    for pair in tile_table.pairs::<String, Table>() {
+        let (name, proto) = match pair {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let collision_mask = extract_collision_mask(&proto);
+        let walking_speed_modifier: f64 = proto.get("walking_speed_modifier").unwrap_or(1.0);
+        let map_color = extract_map_color(&proto);
+
+        tiles.insert(name.clone(), TilePrototype {
+            name,
+            collision_mask,
+            walking_speed_modifier,
+            map_color,
+        });
+    }
+
+    Ok(tiles)
+}
+
 fn extract_collision(proto: &Table) -> ([f64; 4], bool) {
     let collision_box = extract_collision_box(proto).unwrap_or([-0.4, -0.4, 0.4, 0.4]);
 
@@ -206,6 +251,66 @@ fn extract_collision(proto: &Table) -> ([f64; 4], bool) {
     };
 
     (collision_box, collides_player)
+}
+
+fn extract_collision_mask(proto: &Table) -> Option<Vec<String>> {
+    let mask: Table = proto.get("collision_mask").ok()?;
+
+    if let Ok(layers) = mask.get::<Table>("layers") {
+        let mut out = Vec::new();
+        for pair in layers.pairs::<String, mlua::Value>() {
+            let (layer, val) = pair.ok()?;
+            let enabled = match val {
+                mlua::Value::Boolean(b) => b,
+                _ => false,
+            };
+            if enabled {
+                out.push(layer);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+
+    let mut out = Vec::new();
+    for layer in mask.sequence_values::<String>() {
+        if let Ok(v) = layer {
+            out.push(v);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn extract_map_color(proto: &Table) -> Option<(u8, u8, u8)> {
+    let map_color: Table = proto.get("map_color").ok()?;
+    if let (Ok(r), Ok(g), Ok(b)) = (
+        map_color.get::<f64>("r"),
+        map_color.get::<f64>("g"),
+        map_color.get::<f64>("b"),
+    ) {
+        return Some((clamp_color(r), clamp_color(g), clamp_color(b)));
+    }
+    if let (Ok(r), Ok(g), Ok(b)) = (
+        map_color.get::<f64>(1),
+        map_color.get::<f64>(2),
+        map_color.get::<f64>(3),
+    ) {
+        return Some((clamp_color(r), clamp_color(g), clamp_color(b)));
+    }
+    None
+}
+
+fn clamp_color(v: f64) -> u8 {
+    if v <= 1.0 {
+        (v * 255.0).round().clamp(0.0, 255.0) as u8
+    } else {
+        v.round().clamp(0.0, 255.0) as u8
+    }
 }
 
 fn extract_collision_box(proto: &Table) -> Option<[f64; 4]> {

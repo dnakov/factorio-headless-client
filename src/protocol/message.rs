@@ -680,14 +680,14 @@ impl InputAction {
     fn direction_vector(direction: Direction) -> (f64, f64) {
         const SQRT1_2: f64 = 0.7071067811865475;
         match direction {
-            Direction::North => (-0.0, 1.0),
-            Direction::NorthEast => (SQRT1_2, SQRT1_2),
+            Direction::North => (0.0, -1.0),
+            Direction::NorthEast => (SQRT1_2, -SQRT1_2),
             Direction::East => (1.0, 0.0),
-            Direction::SouthEast => (SQRT1_2, -SQRT1_2),
-            Direction::South => (0.0, -1.0),
-            Direction::SouthWest => (-SQRT1_2, -SQRT1_2),
-            Direction::West => (-1.0, -0.0),
-            Direction::NorthWest => (-SQRT1_2, SQRT1_2),
+            Direction::SouthEast => (SQRT1_2, SQRT1_2),
+            Direction::South => (0.0, 1.0),
+            Direction::SouthWest => (-SQRT1_2, SQRT1_2),
+            Direction::West => (-1.0, 0.0),
+            Direction::NorthWest => (-SQRT1_2, -SQRT1_2),
         }
     }
 

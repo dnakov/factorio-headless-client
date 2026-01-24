@@ -25,7 +25,7 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(16); // ~60 Hz
 const CLIENT_TICK_LEAD_INITIAL: u32 = 28; // Space Age (2.0) pcap lead: client_tick = confirmed_tick + 1 + 28
 const CLIENT_TICK_LEAD_MIN: u32 = 1;
-const INITIAL_BLOCK_REQUEST_MAX: u32 = 256; // Avoid over-requesting before transfer size is known.
+const INITIAL_BLOCK_REQUEST_MAX: u32 = 8192;
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,7 +816,6 @@ impl Connection {
         let mut last_new_block_time = std::time::Instant::now();
         let mut last_resend = std::time::Instant::now();
         let mut got_all_blocks = false;
-        let mut all_requested = false;
         let progress_markers: [u8; 12] = [
             0x08, 0x1e, 0x35, 0x44, 0x5c, 0x73, 0x8a, 0xa5, 0xbc, 0xd3, 0xeb, 0xfe,
         ];
@@ -835,54 +834,59 @@ impl Connection {
 
         // Send block requests in rapid batches, but intersperse heartbeats to stay in latency window
         let initial_max = max_block.unwrap_or(INITIAL_BLOCK_REQUEST_MAX);
-        let batch_size = 50;
         let mut sent = 0u32;
         let mut burst_heartbeat = std::time::Instant::now();
         let mut requested_max = initial_max;
         let mut next_request_block = initial_max.saturating_add(1);
         let mut last_expand = std::time::Instant::now();
-        if let Some(max) = max_block {
-            if max <= initial_max {
-                all_requested = true;
-            }
-        }
+        let mut all_requested = max_block.map_or(false, |max| max <= initial_max);
         while sent <= initial_max {
-            let batch_end = (sent + batch_size).min(initial_max + 1);
+            let batch_end = (sent + 200).min(initial_max + 1);
             for i in sent..batch_end {
                 let reliable = self.next_reliable();
                 let request = TransferBlockRequest::new(i, reliable);
                 let _ = self.transport.send_raw(&request.to_bytes()).await;
             }
             sent = batch_end;
-            // Send heartbeat every 16ms during burst to stay in latency window
             if burst_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 if let Some(max) = max_block {
-                    let total = max.saturating_add(1) as f64;
-                    if total > 0.0 {
-                        let progress = ((received_blocks.len() as f64 / total) * 255.0).round() as u8;
-                        last_progress = progress_marker_for(progress, last_progress);
-                    }
+                    let progress = ((received_blocks.len() as f64 / (max + 1) as f64) * 255.0).round() as u8;
+                    last_progress = progress_marker_for(progress, last_progress);
                 }
                 let _ = self.send_state_heartbeat(&[0x01, 0x09, last_progress]).await;
                 burst_heartbeat = std::time::Instant::now();
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // Drain incoming blocks while sending to prevent socket buffer overflow
+            while let Ok(Some(data)) = self.transport.try_recv_raw() {
+                if data.is_empty() { break; }
+                if (data[0] & 0x1F) == MessageType::TransferBlock as u8 && data.len() >= 5 {
+                    let recv_block = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                    if !received_blocks.contains(&recv_block) {
+                        if blocks.len() <= recv_block as usize {
+                            blocks.resize(recv_block as usize + 1, None);
+                        }
+                        blocks[recv_block as usize] = Some(data[5..].to_vec());
+                        received_blocks.insert(recv_block);
+                        last_new_block_time = std::time::Instant::now();
+                    }
+                }
+            }
+            if let Some(max) = max_block {
+                if received_blocks.len() as u32 >= max + 1 {
+                    got_all_blocks = true;
+                    break;
+                }
+            }
         }
         if debug {
-            eprintln!("[DEBUG] Sent {} block requests in batches", initial_max + 1);
+            eprintln!("[DEBUG] Burst done: sent {} requests, received {} blocks, max_block={:?} got_all={}", initial_max + 1, received_blocks.len(), max_block, got_all_blocks);
         }
 
         while start.elapsed() < MAP_DOWNLOAD_TIMEOUT {
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                if debug && !self.pending_confirms.is_empty() {
-                    eprintln!("[DEBUG] Sending heartbeat with {} pending confirms", self.pending_confirms.len());
-                }
                 if let Some(max) = max_block {
-                    let total = max.saturating_add(1) as f64;
-                    if total > 0.0 {
-                        let progress = ((received_blocks.len() as f64 / total) * 255.0).round() as u8;
-                        last_progress = progress_marker_for(progress, last_progress);
-                    }
+                    let progress = ((received_blocks.len() as f64 / (max + 1) as f64) * 255.0).round() as u8;
+                    last_progress = progress_marker_for(progress, last_progress);
                 }
                 let _ = self.send_state_heartbeat(&[0x01, 0x09, last_progress]).await;
                 last_heartbeat = std::time::Instant::now();
@@ -893,18 +897,16 @@ impl Connection {
             }
 
             // Timeout: if no new blocks for 1000ms, assume complete when size is known.
-            if !received_blocks.is_empty() && last_new_block_time.elapsed() > Duration::from_millis(1000) {
-                if max_block.is_some() {
-                    break;
-                }
+            if max_block.is_some() && !received_blocks.is_empty() && last_new_block_time.elapsed() > Duration::from_millis(1000) {
+                break;
             }
 
-            let data = match self.transport.recv_raw_timeout(Duration::from_millis(1)).await {
+            let data = match self.transport.try_recv_raw() {
                 Ok(Some(d)) if !d.is_empty() => d,
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
-                }
+                _ => match self.transport.recv_raw_timeout(Duration::from_millis(1)).await {
+                    Ok(Some(d)) if !d.is_empty() => d,
+                    _ => continue,
+                },
             };
 
             let type_byte = data[0];
@@ -1471,7 +1473,6 @@ impl Connection {
         let type_byte = if reliable { 0x26 } else { 0x06 };
         let mut packet = Vec::with_capacity(14 + state_data.len());
 
-        // Real format: type + flags + msg_id + peer_constant + tick_sync(u16) + tick(u32) + padding(u16) + data
         packet.push(type_byte);
         packet.push(0x10); // flags=0x10 (HasSynchronizerActions) for state data
         packet.extend_from_slice(&msg_id.to_le_bytes());
@@ -1500,10 +1501,9 @@ impl Connection {
         let mut packet = Vec::with_capacity(17);
 
         packet.push(type_byte);
-        packet.push(0x10); // flags=0x10 (HasSynchronizerActions)
+        packet.push(0x10);
         packet.extend_from_slice(&msg_id.to_le_bytes());
         packet.extend_from_slice(&self.peer_constant.to_le_bytes());
-        // Use confirmed_tick from Accept if available, otherwise 0xff
         let (tick_sync, tick, padding): (u16, u32, u16) = if self.confirmed_tick != 0 {
             ((self.confirmed_tick & 0xFFFF) as u16, self.confirmed_tick >> 16, 0x0000)
         } else {
@@ -1512,7 +1512,6 @@ impl Connection {
         packet.extend_from_slice(&tick_sync.to_le_bytes());
         packet.extend_from_slice(&tick.to_le_bytes());
         packet.extend_from_slice(&padding.to_le_bytes());
-        // State data: 01 03 02
         packet.push(0x01);
         packet.push(0x03);
         packet.push(0x02);
@@ -1531,10 +1530,9 @@ impl Connection {
         let mut packet = Vec::with_capacity(14);
 
         packet.push(type_byte);
-        packet.push(0x00); // flags=0 for plain heartbeat
+        packet.push(0x00);
         packet.extend_from_slice(&msg_id.to_le_bytes());
         packet.extend_from_slice(&self.peer_constant.to_le_bytes());
-        // Use confirmed_tick from Accept if available, otherwise 0xff
         let (tick_sync, tick, padding): (u16, u32, u16) = if self.confirmed_tick != 0 {
             ((self.confirmed_tick & 0xFFFF) as u16, self.confirmed_tick >> 16, 0x0000)
         } else {
@@ -1723,15 +1721,15 @@ impl Connection {
             // Use server_tick directly (not +1) to stay within latency window
             let server_tick_echo = self.server_tick_echo();
 
-            let mut packet = Vec::new();
+            let mut packet = Vec::with_capacity(22);
             packet.push(type_byte);
-            packet.push(0x0e); // flags = HasTickClosures | SingleTickClosure | LoadTickOnly
+            packet.push(0x0e);
             packet.extend_from_slice(&msg_id.to_le_bytes());
             packet.extend_from_slice(&self.peer_constant.to_le_bytes());
             packet.extend_from_slice(&client_tick.to_le_bytes());
-            packet.extend_from_slice(&[0u8; 4]); // padding1
+            packet.extend_from_slice(&[0u8; 4]);
             packet.extend_from_slice(&server_tick_echo.to_le_bytes());
-            packet.extend_from_slice(&[0u8; 4]); // padding2
+            packet.extend_from_slice(&[0u8; 4]);
 
             if debug && self.debug_gameplay_heartbeats < 5 {
                 eprintln!(
@@ -1752,9 +1750,9 @@ impl Connection {
                 (0xffff, 0xffffffff, 0xffff)
             };
 
-            let mut packet = Vec::new();
+            let mut packet = Vec::with_capacity(14);
             packet.push(type_byte);
-            packet.push(0x00); // flags=0x00 for sync
+            packet.push(0x00);
             packet.extend_from_slice(&msg_id.to_le_bytes());
             packet.extend_from_slice(&self.peer_constant.to_le_bytes());
             packet.extend_from_slice(&tick_sync.to_le_bytes());
@@ -1795,18 +1793,17 @@ impl Connection {
         let server_tick_echo = self.server_tick_echo();
 
         let type_byte = if reliable { 0x26 } else { 0x06 };
-        let mut packet = Vec::new();
+        let mut packet = Vec::with_capacity(22 + action_data.len());
 
-        // Format: type + flags + msg_id + peer + client_tick + zeros + action_data + server_tick_echo + zeros
         packet.push(type_byte);
         packet.push(flags);
         packet.extend_from_slice(&msg_id.to_le_bytes());
         packet.extend_from_slice(&self.peer_constant.to_le_bytes());
-        packet.extend_from_slice(&client_tick.to_le_bytes());  // [6-9] client_tick
-        packet.extend_from_slice(&[0u8; 4]);                   // [10-13] padding1
-        packet.extend_from_slice(action_data);                 // [14..] action_data
-        packet.extend_from_slice(&server_tick_echo.to_le_bytes()); // server_tick_echo
-        packet.extend_from_slice(&[0u8; 4]);                   // padding2
+        packet.extend_from_slice(&client_tick.to_le_bytes());
+        packet.extend_from_slice(&[0u8; 4]);
+        packet.extend_from_slice(action_data);
+        packet.extend_from_slice(&server_tick_echo.to_le_bytes());
+        packet.extend_from_slice(&[0u8; 4]);
 
         let debug = std::env::var("FACTORIO_DEBUG").is_ok();
         if debug && self.debug_action_packets < 3 {
@@ -1925,12 +1922,11 @@ impl Connection {
         let dir = Direction::from_u8(direction)
             .ok_or_else(|| Error::InvalidPacket("invalid walking direction".into()))?;
         let action = InputAction::move_direction(dir);
-
-        // Start walking state tracking
+        self.update_position_from_ticks();
         self.walking = true;
         self.walking_direction = direction;
         self.last_position_tick = self.server_tick;
-
+        eprintln!("[WALK] start dir={} tick={} pos=({:.4},{:.4})", direction, self.server_tick, self.player_x, self.player_y);
         self.send_heartbeat_with_actions(&[action]).await
     }
 
@@ -1939,12 +1935,9 @@ impl Connection {
         if self.state != ConnectionState::InGame {
             return Err(Error::InvalidPacket("must be in game".into()));
         }
-
-        // Update position for final ticks before stopping
         self.update_position_from_ticks();
-
         self.walking = false;
-
+        eprintln!("[WALK] stop tick={} pos=({:.4},{:.4})", self.server_tick, self.player_x, self.player_y);
         let action = InputAction::stop_walking();
         self.send_heartbeat_with_actions(&[action]).await
     }
@@ -1960,21 +1953,23 @@ impl Connection {
             return;
         }
 
-        let speed = self.character_speed;
-        let distance = ticks_elapsed as f64 * speed;
-
-        let diag = 0.7071; // 1/sqrt(2)
-        let (dx, dy) = match self.walking_direction {
-            0 => (0.0, -distance),
-            1 => (distance * diag, -distance * diag),
-            2 => (distance, 0.0),
-            3 => (distance * diag, distance * diag),
-            4 => (0.0, distance),
-            5 => (-distance * diag, distance * diag),
-            6 => (-distance, 0.0),
-            7 => (-distance * diag, -distance * diag),
+        eprintln!("[WALK] tick_delta={} ({}->{})", ticks_elapsed, self.last_position_tick, self.server_tick);
+        // Factorio truncates per-axis speed to fixed-point (1/256 resolution) each tick
+        let s = self.character_speed;
+        const D: f64 = std::f64::consts::FRAC_1_SQRT_2;
+        let (dx_tick, dy_tick) = match self.walking_direction {
+            0 => (0.0, (s * -256.0).trunc() / 256.0),
+            1 => ((s * D * 256.0).trunc() / 256.0, (s * -D * 256.0).trunc() / 256.0),
+            2 => ((s * 256.0).trunc() / 256.0, 0.0),
+            3 => ((s * D * 256.0).trunc() / 256.0, (s * D * 256.0).trunc() / 256.0),
+            4 => (0.0, (s * 256.0).trunc() / 256.0),
+            5 => ((s * -D * 256.0).trunc() / 256.0, (s * D * 256.0).trunc() / 256.0),
+            6 => ((s * -256.0).trunc() / 256.0, 0.0),
+            7 => ((s * -D * 256.0).trunc() / 256.0, (s * -D * 256.0).trunc() / 256.0),
             _ => (0.0, 0.0),
         };
+        let dx = ticks_elapsed as f64 * dx_tick;
+        let dy = ticks_elapsed as f64 * dy_tick;
 
         let new_x = self.player_x + dx;
         let new_y = self.player_y + dy;
@@ -2307,6 +2302,7 @@ impl Connection {
             };
             if tick > 0 && tick <= u32::MAX as u64 {
                 last_tick = Some(tick as u32);
+                self.update_server_tick(tick as u32, debug, "tick_closure");
             }
             let count_and_segments = match reader.read_opt_u32() {
                 Ok(v) => v,
@@ -2416,10 +2412,6 @@ impl Connection {
                     }
                 }
             }
-        }
-
-        if let Some(tick) = last_tick {
-            self.update_server_tick(tick, debug, "heartbeat");
         }
 
         true
@@ -2578,7 +2570,7 @@ impl Connection {
         let _auxiliary = reader.read_u64_le()?;
         let _crc = reader.read_u32_le()?;
         let map_tick = reader.read_u64_le()?;
-        if transfer_size > 500_000 && transfer_size < 50_000_000 {
+        if transfer_size > 0 && transfer_size < 50_000_000 {
             self.map_transfer_size = Some(transfer_size as u32);
         }
         if map_tick > 0 && map_tick <= u32::MAX as u64 {
@@ -3052,10 +3044,7 @@ impl Connection {
 
             CodecInputAction::StartWalking { direction_x, direction_y } => {
                 if Some(player_index) == self.player_index {
-                    // Update self position before changing direction
-                    self.update_position_from_ticks();
-                    self.walking = true;
-                    self.last_position_tick = current_tick;
+                    // Tracked locally in send_walk for responsiveness
                 } else {
                     // Update other player - assign initial position from map if this is a new player
                     let is_new = !self.other_players.contains_key(&player_index);
@@ -3079,9 +3068,10 @@ impl Connection {
                     if state.walking {
                         let ticks = current_tick.saturating_sub(state.last_tick);
                         if ticks > 0 {
-                            let speed = self.character_speed * ticks as f64;
-                            state.x += state.walk_direction.0 * speed;
-                            state.y += state.walk_direction.1 * speed;
+                            let dx_tick = (self.character_speed * state.walk_direction.0 * 256.0).trunc() / 256.0;
+                            let dy_tick = (self.character_speed * state.walk_direction.1 * 256.0).trunc() / 256.0;
+                            state.x += dx_tick * ticks as f64;
+                            state.y += dy_tick * ticks as f64;
                         }
                     }
                     state.walking = true;
@@ -3092,16 +3082,15 @@ impl Connection {
 
             CodecInputAction::StopWalking => {
                 if Some(player_index) == self.player_index {
-                    self.update_position_from_ticks();
-                    self.walking = false;
+                    // Tracked locally in send_stop_walk for responsiveness
                 } else if let Some(state) = self.other_players.get_mut(&player_index) {
-                    // Apply final movement before stopping
                     if state.walking {
                         let ticks = current_tick.saturating_sub(state.last_tick);
                         if ticks > 0 {
-                            let speed = self.character_speed * ticks as f64;
-                            state.x += state.walk_direction.0 * speed;
-                            state.y += state.walk_direction.1 * speed;
+                            let dx_tick = (self.character_speed * state.walk_direction.0 * 256.0).trunc() / 256.0;
+                            let dy_tick = (self.character_speed * state.walk_direction.1 * 256.0).trunc() / 256.0;
+                            state.x += dx_tick * ticks as f64;
+                            state.y += dy_tick * ticks as f64;
                         }
                     }
                     state.walking = false;
@@ -3147,9 +3136,10 @@ impl Connection {
                 if state.walking {
                     let ticks = current_tick.saturating_sub(state.last_tick);
                     if ticks > 0 {
-                        let speed = self.character_speed * ticks as f64;
-                        state.x += state.walk_direction.0 * speed;
-                        state.y += state.walk_direction.1 * speed;
+                        let dx_tick = (self.character_speed * state.walk_direction.0 * 256.0).trunc() / 256.0;
+                        let dy_tick = (self.character_speed * state.walk_direction.1 * 256.0).trunc() / 256.0;
+                        state.x += dx_tick * ticks as f64;
+                        state.y += dy_tick * ticks as f64;
                         state.last_tick = current_tick;
                     }
                 }

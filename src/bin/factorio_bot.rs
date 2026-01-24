@@ -33,6 +33,16 @@ enum Commands {
         direction: u8,
     },
     Stop,
+    MoveTo {
+        #[arg(long)]
+        x: f64,
+        #[arg(long)]
+        y: f64,
+        #[arg(long)]
+        tolerance: Option<f64>,
+        #[arg(long)]
+        max_nodes: Option<u64>,
+    },
     Mine {
         #[arg(long)]
         x: f64,
@@ -154,6 +164,16 @@ fn send_command(cmd: Commands) -> Result<Response, Box<dyn std::error::Error>> {
         Commands::Status => ("status", json!({})),
         Commands::Walk { direction } => ("walk", json!({"direction": direction})),
         Commands::Stop => ("stop", json!({})),
+        Commands::MoveTo { x, y, tolerance, max_nodes } => {
+            let mut args = json!({"x": x, "y": y});
+            if let Some(t) = tolerance {
+                args["tolerance"] = json!(t);
+            }
+            if let Some(m) = max_nodes {
+                args["max_nodes"] = json!(m);
+            }
+            ("move-to", args)
+        }
         Commands::Mine { x, y } => ("mine", json!({"x": x, "y": y})),
         Commands::StopMining => ("stop-mining", json!({})),
         Commands::Craft { recipe_id, count } => ("craft", json!({"recipe_id": recipe_id, "count": count})),
