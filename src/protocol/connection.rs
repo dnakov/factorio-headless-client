@@ -3245,6 +3245,10 @@ impl Connection {
             }
         };
 
+        // Update heartbeat timestamp for ANY heartbeat packet (fragmented or not)
+        // to prevent timeout while collecting fragments.
+        self.last_server_heartbeat_at = Some(std::time::Instant::now());
+
         // Reassemble fragmented heartbeats before parsing payload.
         if header.fragmented {
             if let Some(reassembled) = self.collect_fragmented_heartbeat(&header, data, payload_start) {
@@ -3256,7 +3260,6 @@ impl Connection {
         let hb_start = std::time::Instant::now();
         let now = std::time::Instant::now();
         let old_elapsed = self.last_server_heartbeat_at.map(|t| t.elapsed().as_millis());
-        self.last_server_heartbeat_at = Some(now);
         // Verify the timestamp was actually set
         let verify_elapsed = self.last_server_heartbeat_at.map(|t| t.elapsed().as_millis()).unwrap_or(99999);
         if std::env::var("FACTORIO_DEBUG_TIMEOUT").is_ok() && self.state == ConnectionState::InGame {
