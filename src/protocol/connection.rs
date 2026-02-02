@@ -1631,6 +1631,26 @@ impl Connection {
                 self.client_tick = start;
             }
 
+            // CRITICAL: If start_sending_tick is more than 30 ticks behind confirmed_tick,
+            // the server will ignore our heartbeats as being too old. Update it to be
+            // closer to current time. This can happen when there's a delay between
+            // receiving ClientShouldStartSendingTickClosures and actually transitioning
+            // to InGame (e.g., while waiting for player_index confirmation).
+            if let Some(start) = self.start_sending_tick {
+                if self.confirmed_tick > 10_000 && self.confirmed_tick > start {
+                    let lag = self.confirmed_tick - start;
+                    if lag > 30 {
+                        let new_start = self.confirmed_tick.saturating_sub(2);
+                        if std::env::var("FACTORIO_DEBUG").is_ok() {
+                            eprintln!("[DEBUG] start_sending_tick {} is {} ticks behind confirmed_tick {}, updating to {}",
+                                start, lag, self.confirmed_tick, new_start);
+                        }
+                        self.start_sending_tick = Some(new_start);
+                        self.client_tick = new_start;
+                    }
+                }
+            }
+
             // Allow immediate heartbeat send when entering InGame
             self.mark_needs_immediate_heartbeat();
             self.state = ConnectionState::InGame;
@@ -2888,6 +2908,12 @@ impl Connection {
             .await
     }
 
+    /// Send empty tick closure, bypassing rate limiting. Used for burst catchup.
+    async fn send_empty_action_tick_force(&mut self) -> Result<()> {
+        self.send_ingame_heartbeat_with_payload_force(0x0e, None, None)
+            .await
+    }
+
 
     fn action_player_delta(player_index: u16) -> u16 {
         // For tick closures, player deltas are relative to the previous action.
@@ -3122,10 +3148,13 @@ impl Connection {
                 // be BEHIND empty ticks we already sent (which causes server to reject).
                 let lead = self.desired_tick_lead();
                 let target = server_echo.saturating_add(lead);
+                // Limit catchup to 3 ticks per flush to avoid overwhelming the server.
+                // The poll loop runs frequently, so we'll still catch up relatively quickly.
+                let max_catchup = 3u32;
                 let mut sent = 0u32;
                 while self.client_tick <= target
                     && self.can_send_tick_closure()
-                    && sent < MAX_CATCHUP_TICKS_PER_FLUSH
+                    && sent < max_catchup
                 {
                     let _ = self.send_empty_action_tick().await?;
                     sent += 1;
@@ -3160,12 +3189,13 @@ impl Connection {
         let poll_id = self.debug_poll_counter;
         self.debug_current_poll_id = poll_id;
         let debug_poll = std::env::var("FACTORIO_DEBUG_POLL").is_ok();
+        let debug = std::env::var("FACTORIO_DEBUG").is_ok();
         let mut result = None;
         if let Some(data) = self.transport.recv_raw_timeout(Duration::from_millis(1)).await? {
             if !data.is_empty() {
                 let msg_type = data[0] & 0x1F;
-                if debug_poll && self.state == ConnectionState::InGame {
-                    eprintln!("[DEBUG] poll: received msg_type=0x{:02x} len={}", msg_type, data.len());
+                if (debug_poll || debug) && self.state == ConnectionState::InGame {
+                    eprintln!("[DEBUG] poll#{}: received msg_type=0x{:02x} len={}", poll_id, msg_type, data.len());
                 }
 
                 if msg_type == MessageType::Empty as u8 {
@@ -3364,6 +3394,15 @@ impl Connection {
                         let head = &payload[pos..payload.len().min(pos + 32)];
                         eprintln!("[DEBUG] HB: tick closure head={:02x?}", head);
                         self.debug_tick_closure_failures += 1;
+                    }
+                }
+                // Fallback: try to extract tick directly from the start of tick closure data.
+                // Format is typically: [tick u32 LE][...] - the first 4 bytes are the tick.
+                let remaining = &payload[pos..];
+                if remaining.len() >= 4 {
+                    let tick = u32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]);
+                    if self.is_tick_plausible(tick) {
+                        self.update_confirmed_tick(tick, debug, "tick-closure-fallback");
                     }
                 }
                 if let Some(offset) = self.find_confirm_record_start(&payload[pos..]) {
