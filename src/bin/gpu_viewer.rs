@@ -301,7 +301,7 @@ fn run_terminal(mut game: GameState, mode: DisplayMode) -> Result<(), Box<dyn st
             if ent.x < min_x - 2.0 || ent.x > max_x + 2.0 || ent.y < min_y - 2.0 || ent.y > max_y + 2.0 {
                 continue;
             }
-            let uv = match atlas.get_uv(&ent.name) {
+            let uv = match atlas.get_uv_or_fallback(&ent.name) {
                 Some(uv) => uv,
                 None => continue,
             };
@@ -343,7 +343,13 @@ fn run_terminal(mut game: GameState, mode: DisplayMode) -> Result<(), Box<dyn st
         gpu.readback(&mut pixels);
         match mode {
             DisplayMode::Kitty => {
-                draw_kitty(&mut out, &mut png_buf, &pixels, render_w, render_h, term_cols, term_rows)?;
+                let spec = KittyDrawSpec {
+                    width: render_w,
+                    height: render_h,
+                    cols: term_cols,
+                    rows: term_rows,
+                };
+                draw_kitty(&mut out, &mut png_buf, &pixels, spec)?;
             }
             DisplayMode::Iterm2 => {
                 draw_iterm2(&mut out, &pixels, render_w, render_h, &mut png_buf)?;
@@ -385,16 +391,25 @@ fn compute_render_size(mode: DisplayMode, cols: u32, rows: u32) -> (u32, u32) {
     }
 }
 
+struct KittyDrawSpec {
+    width: u32,
+    height: u32,
+    cols: u32,
+    rows: u32,
+}
+
 fn draw_kitty(
-    out: &mut impl Write, png_buf: &mut Vec<u8>, pixels: &[u8],
-    width: u32, height: u32, cols: u32, rows: u32,
+    out: &mut impl Write,
+    png_buf: &mut Vec<u8>,
+    pixels: &[u8],
+    spec: KittyDrawSpec,
 ) -> std::io::Result<()> {
     png_buf.clear();
     image::codecs::png::PngEncoder::new_with_quality(
         &mut *png_buf,
         image::codecs::png::CompressionType::Fast,
         image::codecs::png::FilterType::Sub,
-    ).write_image(pixels, width, height, image::ExtendedColorType::Rgba8)
+    ).write_image(pixels, spec.width, spec.height, image::ExtendedColorType::Rgba8)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let encoded = base64_encode(png_buf);
@@ -407,7 +422,7 @@ fn draw_kitty(
         let more = if i < chunks.len() - 1 { 1 } else { 0 };
         if i == 0 {
             write!(out, "\x1b_Ga=T,f=100,s={},v={},c={},r={},m={};",
-                width, height, cols, rows, more)?;
+                spec.width, spec.height, spec.cols, spec.rows, more)?;
         } else {
             write!(out, "\x1b_Gm={};", more)?;
         }

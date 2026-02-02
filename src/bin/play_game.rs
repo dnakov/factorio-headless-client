@@ -34,24 +34,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         connection.player_position().1);
     println!("Initial tick: {}\n", connection.server_tick());
 
+    // Pump to establish stable heartbeat before actions
+    pump_connection(&mut connection, Duration::from_millis(500)).await?;
+
     // Send a chat message
     println!("Sending chat message...");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    connection.send_chat("Hello from Rust bot!").await?;
+    connection.actions().send_chat("Hello from Rust bot!").await?;
     println!("Chat message sent!\n");
 
     // Exercise movement + mining actions
     println!("Walking north...");
-    connection.send_walk(0).await?;
+    connection.actions().send_walk(0).await?;
     pump_connection(&mut connection, Duration::from_millis(800)).await?;
     println!("Stopping...");
-    connection.send_stop_walk().await?;
+    connection.actions().send_stop_walk().await?;
     pump_connection(&mut connection, Duration::from_millis(400)).await?;
 
     println!("Mining...");
-    connection.send_begin_mine().await?;
+    connection.actions().send_begin_mine().await?;
     pump_connection(&mut connection, Duration::from_millis(600)).await?;
-    connection.send_stop_mine().await?;
+    connection.actions().send_stop_mine().await?;
     pump_connection(&mut connection, Duration::from_millis(400)).await?;
 
     // Just stay alive - no actions
@@ -78,7 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(8)).await;
 
         let cur_tick = connection.server_tick();
-        if start.elapsed().as_secs() % 5 == 0 && start.elapsed().subsec_millis() < 20 {
+        let elapsed = start.elapsed().as_secs();
+        // Print every 2 seconds
+        if elapsed % 2 == 0 && start.elapsed().subsec_millis() < 50 {
             println!("  tick={} (delta={}) hb={} other={} none={} state={:?}",
                 cur_tick, cur_tick.wrapping_sub(last_tick), heartbeat_count, other_count, none_count, connection.state());
             last_tick = cur_tick;

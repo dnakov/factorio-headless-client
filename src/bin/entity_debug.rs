@@ -2,14 +2,20 @@ use std::io::{Read, Cursor, Write as IoWrite};
 use std::net::TcpStream;
 use std::collections::HashMap;
 use flate2::read::ZlibDecoder;
-use factorio_client::codec::{BinaryReader, parse_map_data};
+use factorio_client::codec::{BinaryReader, MapEntity, parse_map_data, parse_map_resources};
 use factorio_client::codec::entity_parsers::parse_chunk_entities;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let map_path = args.get(1).map(|s| s.as_str()).unwrap_or("server_map.zip");
+    let compare_only = args.iter().any(|a| a == "--compare-only");
+    let compare_resources = compare_only && !args.iter().any(|a| a == "--no-resources");
+    let map_path = args.iter().skip(1).find(|a| !a.starts_with("--")).map(|s| s.as_str()).unwrap_or("server_map.zip");
 
     unsafe { std::env::set_var("FACTORIO_NO_PROCEDURAL", "1"); }
+    if compare_only {
+        std::env::set_var("FACTORIO_SKIP_TILE_PARSE", "1");
+        std::env::set_var("FACTORIO_SKIP_RESOURCE_PARSE", "1");
+    }
 
     println!("=== Entity Debug: {} ===\n", map_path);
 
@@ -30,6 +36,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nEntity counts by type:");
     for (name, count) in &type_counts {
         println!("  {:30} {}", name, count);
+    }
+
+    if compare_only {
+        let mut compare_entities = map_data.entities.clone();
+        if compare_resources {
+            if let Ok(resources) = parse_map_resources(&data) {
+                compare_entities.extend(resources);
+            }
+        }
+        // Dedup by (name, tile_x, tile_y)
+        let mut unique: HashMap<(String, i32, i32), MapEntity> = HashMap::new();
+        for ent in compare_entities {
+            let key = (ent.name.clone(), ent.x.floor() as i32, ent.y.floor() as i32);
+            unique.entry(key).or_insert(ent);
+        }
+        let compare_entities: Vec<MapEntity> = unique.into_values().collect();
+
+        let (half_w, half_h) = if map_data.map_width > 0 && map_data.map_height > 0 {
+            ((map_data.map_width / 2) as i32, (map_data.map_height / 2) as i32)
+        } else {
+            (100, 100)
+        };
+
+        let mut parsed_counts: HashMap<String, usize> = HashMap::new();
+        for ent in &compare_entities {
+            if ent.x.abs() <= half_w as f64 && ent.y.abs() <= half_h as f64 {
+                *parsed_counts.entry(ent.name.clone()).or_default() += 1;
+            }
+        }
+
+        println!("\n=== RCON Ground Truth ===\n");
+        match rcon_command("/c local s=game.surfaces[1] local n=0 for _ in s.get_chunks() do n=n+1 end rcon.print(n)") {
+            Ok(resp) => println!("Server chunks: {}", resp.trim()),
+            Err(e) => println!("  chunk query failed: {}", e),
+        }
+        let bounds_cmd = format!(
+            "/c local s=game.surfaces[1] local area={{{{{},{}}},{{{},{}}}}} local n=0 for _,e in pairs(s.find_entities_filtered{{area=area}}) do n=n+1 end rcon.print(n)",
+            -half_w, -half_h, half_w, half_h
+        );
+        match rcon_command(&bounds_cmd) {
+            Ok(resp) => println!("Entities within ±{}x{}: {} (our parse: {})", half_w, half_h, resp.trim(), compare_entities.len()),
+            Err(e) => println!("  bounded query failed: {}", e),
+        }
+        match rcon_entity_counts_with_area(half_w, half_h) {
+            Ok(counts) => {
+                println!("Server entity counts within bounds (top 20):");
+                let mut rcon_types: Vec<_> = counts.iter().collect();
+                rcon_types.sort_by(|a, b| b.1.cmp(a.1));
+                for (name, count) in rcon_types.iter().take(20) {
+                    let parsed = parsed_counts.get(name.as_str()).copied().unwrap_or(0);
+                    let pct = if *count > &0 { parsed as f64 / **count as f64 * 100.0 } else { 0.0 };
+                    println!("  {:30} server={:5}  parsed={:5}  ({:.0}%)", name, count, parsed, pct);
+                }
+
+                let mut missing: Vec<(&String, i64)> = counts
+                    .iter()
+                    .map(|(name, count)| {
+                        let parsed = parsed_counts.get(name.as_str()).copied().unwrap_or(0);
+                        (name, *count as i64 - parsed as i64)
+                    })
+                    .filter(|(_, delta)| *delta > 0)
+                    .collect();
+                missing.sort_by(|a, b| b.1.cmp(&a.1));
+                println!("\nTop missing vs server:");
+                for (name, delta) in missing.iter().take(20) {
+                    let parsed = parsed_counts.get(name.as_str()).copied().unwrap_or(0);
+                    println!("  {:30} missing={:5}  parsed={:5}", name, delta, parsed);
+                }
+
+                let mut extra: Vec<(&String, i64)> = parsed_counts
+                    .iter()
+                    .map(|(name, count)| {
+                        let server = counts.get(name).copied().unwrap_or(0);
+                        (name, *count as i64 - server as i64)
+                    })
+                    .filter(|(_, delta)| *delta > 0)
+                    .collect();
+                extra.sort_by(|a, b| b.1.cmp(&a.1));
+                println!("\nTop extra vs server:");
+                for (name, delta) in extra.iter().take(20) {
+                    let server = counts.get(*name).copied().unwrap_or(0);
+                    println!("  {:30} extra={:5}  server={:5}", name, delta, server);
+                }
+            }
+            Err(e) => println!("  RCON failed: {} (server may not be running)", e),
+        }
+        return Ok(());
     }
 
     // Now do detailed chunk-level analysis
@@ -946,6 +1039,32 @@ fn rcon_entity_counts() -> Result<HashMap<String, usize>, Box<dyn std::error::Er
     // Get entity counts by type
     let cmd = r#"/c local counts = {} for _, e in pairs(game.surfaces[1].find_entities_filtered{}) do counts[e.name] = (counts[e.name] or 0) + 1 end local s = "" for k, v in pairs(counts) do s = s .. k .. "=" .. v .. "\n" end rcon.print(s)"#;
     rcon_send(&mut stream, 2, 2, cmd)?;
+    let response = rcon_recv(&mut stream)?;
+
+    let mut counts = HashMap::new();
+    for line in response.lines() {
+        if let Some((name, count_str)) = line.split_once('=') {
+            if let Ok(count) = count_str.trim().parse::<usize>() {
+                counts.insert(name.to_string(), count);
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn rcon_entity_counts_with_area(half_w: i32, half_h: i32) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect("127.0.0.1:27015")?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    // Auth
+    rcon_send(&mut stream, 1, 3, "factorio123")?;
+    let _ = rcon_recv(&mut stream)?;
+
+    let cmd = format!(
+        "/c local counts = {{}} local s=game.surfaces[1] local area={{{{{},{}}},{{{},{}}}}} for _, e in pairs(s.find_entities_filtered{{area=area}}) do counts[e.name] = (counts[e.name] or 0) + 1 end local out = \"\" for k, v in pairs(counts) do out = out .. k .. \"=\" .. v .. \"\\n\" end rcon.print(out)",
+        -half_w, -half_h, half_w, half_h
+    );
+    rcon_send(&mut stream, 2, 2, &cmd)?;
     let response = rcon_recv(&mut stream)?;
 
     let mut counts = HashMap::new();

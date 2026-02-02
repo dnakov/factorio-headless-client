@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
-use mlua::{Result as LuaResult, Table};
+use mlua::{Result as LuaResult, Table, Value};
 use crate::lua::FactorioLua;
 
 static PROTOTYPES: OnceLock<Prototypes> = OnceLock::new();
@@ -18,11 +18,26 @@ pub struct EntityPrototype {
     pub name: String,
     pub collision_box: [f64; 4], // [x1, y1, x2, y2] relative to entity center
     pub collides_player: bool,
+    pub resource_infinite: bool,
+    pub resource_mining_time: Option<f64>,
+    pub pickup_position: Option<(f64, f64)>,
+    pub drop_position: Option<(f64, f64)>,
+    pub inserter_stack_size: Option<u8>,
+    pub inserter_rotation_speed: Option<f64>,
+    pub inserter_extension_speed: Option<f64>,
+    pub belt_speed: Option<f64>,
+    pub underground_max_distance: Option<u8>,
+    pub crafting_speed: Option<f64>,
+    pub mining_speed: Option<f64>,
+    pub running_speed: Option<f64>,
+    pub distance_per_frame: Option<f64>,
+    pub maximum_corner_sliding_distance: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ItemPrototype {
     pub name: String,
+    pub item_type: String,
     pub stack_size: u32,
     pub weight: Option<f64>,
     pub fuel_value: Option<String>,
@@ -83,7 +98,7 @@ impl Prototypes {
     let items = extract_items(&data_raw)?;
     let entities = extract_entities(&data_raw)?;
     let tiles = extract_tiles(&data_raw)?;
-    let recipes = HashMap::new();
+    let recipes = extract_recipes(&data_raw)?;
 
     Ok(Self { items, recipes, tiles, entities })
 }
@@ -155,6 +170,7 @@ fn extract_items(data_raw: &Table) -> LuaResult<HashMap<String, ItemPrototype>> 
 
                     items.insert(name.clone(), ItemPrototype {
                         name,
+                        item_type: item_type.to_string(),
                         stack_size,
                         weight,
                         fuel_value,
@@ -199,15 +215,165 @@ fn extract_entities(data_raw: &Table) -> LuaResult<HashMap<String, EntityPrototy
             };
 
             let (collision_box, collides_player) = extract_collision(&proto);
+            let resource_infinite = if entity_type == "resource" {
+                proto.get::<bool>("infinite").unwrap_or(false)
+            } else {
+                false
+            };
+            let resource_mining_time = if entity_type == "resource" {
+                proto.get::<Table>("minable").ok().and_then(|t| t.get::<f64>("mining_time").ok())
+            } else {
+                None
+            };
+            let (pickup_position, drop_position) = if entity_type == "inserter" {
+                (
+                    proto.get::<Value>("pickup_position").ok().and_then(parse_position),
+                    proto.get::<Value>("insert_position").ok().and_then(parse_position),
+                )
+            } else {
+                (None, None)
+            };
+            let inserter_stack_size = if entity_type == "inserter" {
+                proto.get::<u8>("stack_size_bonus").ok()
+            } else {
+                None
+            };
+            let inserter_rotation_speed = if entity_type == "inserter" {
+                proto.get::<f64>("rotation_speed").ok()
+            } else {
+                None
+            };
+            let inserter_extension_speed = if entity_type == "inserter" {
+                proto.get::<f64>("extension_speed").ok()
+            } else {
+                None
+            };
+            let belt_speed = proto.get::<f64>("speed").ok();
+            let underground_max_distance = proto.get::<u8>("max_distance").ok();
+            let crafting_speed = proto.get::<f64>("crafting_speed").ok();
+            let mining_speed = proto.get::<f64>("mining_speed").ok();
+            let running_speed = proto.get::<f64>("running_speed").ok();
+            let distance_per_frame = proto.get::<f64>("distance_per_frame").ok();
+            let maximum_corner_sliding_distance = proto.get::<f64>("maximum_corner_sliding_distance").ok();
             entities.insert(name.clone(), EntityPrototype {
                 name,
                 collision_box,
                 collides_player,
+                resource_infinite,
+                resource_mining_time,
+                pickup_position,
+                drop_position,
+                inserter_stack_size,
+                inserter_rotation_speed,
+                inserter_extension_speed,
+                belt_speed,
+                underground_max_distance,
+                crafting_speed,
+                mining_speed,
+                running_speed,
+                distance_per_frame,
+                maximum_corner_sliding_distance,
             });
         }
     }
 
     Ok(entities)
+}
+
+fn extract_recipes(data_raw: &Table) -> LuaResult<HashMap<String, RecipePrototype>> {
+    let mut recipes = HashMap::new();
+    let recipe_table: Table = match data_raw.get("recipe") {
+        Ok(t) => t,
+        Err(_) => return Ok(recipes),
+    };
+
+    for pair in recipe_table.pairs::<String, Table>() {
+        let (name, proto) = match pair {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let data = if let Ok(normal) = proto.get::<Table>("normal") {
+            normal
+        } else {
+            proto.clone()
+        };
+
+        let category: String = data.get("category").unwrap_or_else(|_| "crafting".to_string());
+        let energy_required: f64 = data.get("energy_required").unwrap_or(0.5);
+        let ingredients = data
+            .get::<Table>("ingredients")
+            .ok()
+            .map(parse_ingredients)
+            .unwrap_or_default();
+
+        let results = if let Ok(results_table) = data.get::<Table>("results") {
+            parse_ingredients(results_table)
+        } else if let Ok(result_name) = data.get::<String>("result") {
+            let count: u32 = data.get("result_count").unwrap_or(1);
+            vec![Ingredient { name: result_name, amount: count, ingredient_type: "item".to_string() }]
+        } else {
+            Vec::new()
+        };
+
+        recipes.insert(name.clone(), RecipePrototype {
+            name,
+            category,
+            energy_required,
+            ingredients,
+            results,
+        });
+    }
+
+    Ok(recipes)
+}
+
+fn parse_position(value: Value) -> Option<(f64, f64)> {
+    match value {
+        Value::Table(t) => {
+            if let Ok(x) = t.get::<f64>("x") {
+                if let Ok(y) = t.get::<f64>("y") {
+                    return Some((x, y));
+                }
+            }
+            let x = t.get::<f64>(1).ok()?;
+            let y = t.get::<f64>(2).ok()?;
+            Some((x, y))
+        }
+        _ => None,
+    }
+}
+
+fn parse_ingredients(table: Table) -> Vec<Ingredient> {
+    let mut list = Vec::new();
+    for value in table.sequence_values::<Value>() {
+        let value = match value {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(ing) = parse_ingredient(value) {
+            list.push(ing);
+        }
+    }
+    list
+}
+
+fn parse_ingredient(value: Value) -> Option<Ingredient> {
+    match value {
+        Value::Table(t) => {
+            if let Ok(name) = t.get::<String>("name") {
+                let amount: u32 = t.get("amount").unwrap_or(1);
+                let ingredient_type: String = t.get("type").unwrap_or_else(|_| "item".to_string());
+                Some(Ingredient { name, amount, ingredient_type })
+            } else {
+                let name: String = t.get(1).ok()?;
+                let amount: u32 = t.get(2).unwrap_or(1);
+                let ingredient_type: String = t.get("type").unwrap_or_else(|_| "item".to_string());
+                Some(Ingredient { name, amount, ingredient_type })
+            }
+        }
+        _ => None,
+    }
 }
 
 fn extract_tiles(data_raw: &Table) -> LuaResult<HashMap<String, TilePrototype>> {

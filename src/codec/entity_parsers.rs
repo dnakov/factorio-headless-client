@@ -7,6 +7,9 @@ pub struct EntityParseResult {
     pub position: (i32, i32),
     pub proto_id: u16,
     pub name: String,
+    pub resource_amount: Option<u32>,
+    pub resource_infinite: bool,
+    pub underground_type: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,28 +118,28 @@ fn skip_corpse(reader: &mut BinaryReader) -> Result<()> {
 }
 
 /// Skip type-specific entity data. Returns false if the type is unknown.
-fn skip_type_specific(reader: &mut BinaryReader, entity_type: &str) -> Result<bool> {
+fn skip_type_specific(reader: &mut BinaryReader, entity_type: &str) -> Result<(bool, Option<u32>, bool, Option<u8>)> {
     match entity_type {
         "resource" => {
-            reader.skip(4)?;
+            let amount = reader.read_u32_le()?;
             let infinite = reader.read_bool()?;
             if infinite {
-                reader.skip(4)?;
+                reader.read_u32_le()?;
             }
             reader.skip(1)?;
-            Ok(true)
+            Ok((true, Some(amount), infinite, None))
         }
         "tree" => {
             reader.skip(3)?;
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "simple-entity" => {
             reader.skip(1)?;
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "simple-entity-with-owner" | "simple-entity-with-force" => {
             reader.skip(16)?; // 4×u8 + u16 + u8 graphics + 8 bytes color + u8 direction
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "fish" => {
             reader.skip(2)?; // UpdatableEntity
@@ -144,34 +147,38 @@ fn skip_type_specific(reader: &mut BinaryReader, entity_type: &str) -> Result<bo
             reader.skip(4)?; // RealOrientation (float)
             reader.skip(8)?; // speed (double)
             reader.skip(4)?; // tick counter (u32)
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "cliff" => {
             reader.skip(2)?; // orientation + variant
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "corpse" => {
             skip_corpse(reader)?;
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "rail-remnants" => {
             skip_corpse(reader)?;
             reader.skip(1)?; // Direction
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "item-entity" => {
             skip_item_stack(reader)?;
             reader.skip(1)?;
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "deconstructible-tile-proxy" => {
             reader.skip(4)?; // u8 + u16 + u8
-            Ok(true)
+            Ok((true, None, false, None))
         }
         "container" | "logistic-container" => {
-            Ok(skip_container(reader).is_ok())
+            Ok((skip_container(reader).is_ok(), None, false, None))
         }
-        _ => Ok(false),
+        "underground-belt" => {
+            let belt_type = reader.read_u8()?;
+            Ok((true, None, false, Some(belt_type)))
+        }
+        _ => Ok((false, None, false, None)),
     }
 }
 
@@ -181,7 +188,7 @@ fn parse_entity(
     reader: &mut BinaryReader,
     entity_type: &str,
     last_pos: &mut (i32, i32),
-) -> Result<Option<(i32, i32)>> {
+) -> Result<Option<((i32, i32), Option<u32>, bool, Option<u8>)>> {
     let position = read_map_position_delta(reader, last_pos)?;
     let flags = reader.read_u16_le()?;
 
@@ -197,11 +204,12 @@ fn parse_entity(
         EntityClass::Entity => {}
     }
 
-    if !skip_type_specific(reader, entity_type)? {
+    let (ok, amount, infinite, underground_type) = skip_type_specific(reader, entity_type)?;
+    if !ok {
         return Ok(None);
     }
 
-    Ok(Some(position))
+    Ok(Some((position, amount, infinite, underground_type)))
 }
 
 /// Skip the military targets and active entities sections between "/T" and the entity loop.
@@ -271,11 +279,14 @@ pub fn parse_chunk_entities(
             .unwrap_or("");
 
         match parse_entity(&mut reader, entity_type, &mut last_pos) {
-            Ok(Some(position)) => {
+            Ok(Some((position, resource_amount, resource_infinite, underground_type))) => {
                 entities.push(EntityParseResult {
                     position,
                     proto_id,
                     name: entity_name,
+                    resource_amount,
+                    resource_infinite,
+                    underground_type,
                 });
             }
             Ok(None) => {
@@ -283,6 +294,9 @@ pub fn parse_chunk_entities(
                     position: last_pos,
                     proto_id,
                     name: entity_name,
+                    resource_amount: None,
+                    resource_infinite: false,
+                    underground_type: None,
                 });
                 if !recover_to_next_entity(&mut reader, data, &last_pos, entity_prototypes, chunk_x, chunk_y) {
                     break;

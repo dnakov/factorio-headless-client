@@ -1,4 +1,4 @@
-use crate::codec::{MapPosition, Direction, Color};
+use crate::codec::{MapPosition, Direction, Color, LogisticFilter};
 use crate::state::inventory::{Inventory, ItemStack};
 
 /// Player identifier
@@ -49,6 +49,9 @@ pub struct Player {
     pub armor_inventory: Option<Inventory>,
     pub guns_inventory: Option<Inventory>,
     pub ammo_inventory: Option<Inventory>,
+
+    // Logistics
+    pub logistic_requests: Vec<LogisticFilter>,
 }
 
 impl Player {
@@ -80,6 +83,7 @@ impl Player {
             armor_inventory: None,
             guns_inventory: None,
             ammo_inventory: None,
+            logistic_requests: Vec::new(),
         }
     }
 

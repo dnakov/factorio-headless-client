@@ -120,6 +120,34 @@ impl TextureAtlas {
     pub fn get_uv(&self, entity_name: &str) -> Option<[f32; 4]> {
         self.uvs.get(entity_name).copied()
     }
+
+    pub fn get_uv_or_fallback(&self, entity_name: &str) -> Option<[f32; 4]> {
+        if let Some(uv) = self.get_uv(entity_name) {
+            return Some(uv);
+        }
+
+        let fallback = if entity_name.contains("iron-ore") {
+            "iron-ore"
+        } else if entity_name.contains("copper-ore") {
+            "copper-ore"
+        } else if entity_name.contains("uranium") {
+            "uranium-ore"
+        } else if entity_name == "coal" {
+            "coal"
+        } else if entity_name == "stone" {
+            "stone"
+        } else if entity_name.contains("tree") || entity_name.contains("dead-") {
+            "tree-01"
+        } else if entity_name.contains("rock") {
+            "big-rock"
+        } else if entity_name.contains("fish") {
+            "fish"
+        } else {
+            "unknown"
+        };
+
+        self.get_uv(fallback)
+    }
 }
 
 fn scan_icon_paths(factorio_path: &Path) -> Vec<(String, PathBuf)> {
@@ -144,6 +172,7 @@ fn scan_icon_paths(factorio_path: &Path) -> Vec<(String, PathBuf)> {
     // Scan icon directories for direct PNGs
     let icon_dirs = [
         factorio_path.join("base/graphics/icons"),
+        factorio_path.join("core/graphics/icons"),
         factorio_path.join("core/graphics/icons/entity"),
     ];
     for icons_dir in &icon_dirs {
@@ -190,4 +219,3 @@ fn parse_lua_icons(content: &str, factorio_path: &Path, results: &mut Vec<(Strin
         }
     }
 }
-

@@ -1,7 +1,8 @@
-use std::io::{Read, Cursor};
-use flate2::read::ZlibDecoder;
+use std::io::{Cursor, Read};
 use factorio_client::codec::{BinaryReader, parse_map_data};
 use factorio_client::codec::entity_parsers::skip_pre_entity_sections;
+
+mod bin_util;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { std::env::set_var("FACTORIO_NO_PROCEDURAL", "1"); }
@@ -177,8 +178,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn decompress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
-    Ok(out)
+    bin_util::decompress_zlib(data)
 }

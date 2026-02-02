@@ -18,8 +18,9 @@ pub use message::{
     ConnectionRequest, ConnectionRequestReply, ConnectionRequestReplyConfirm,
     ConnectionAcceptOrDeny, DenialReason, ServerInfo,
     TransferBlockRequest, TransferBlock,
-    ClientToServerHeartbeat, ServerToClientHeartbeat,
+    ClientToServerHeartbeat,
     InputAction,
 };
 pub use transport::Transport;
 pub use connection::{Connection, ConnectionState, PlayerState, ReceivedPacket};
+pub use connection::ConnectionActions;

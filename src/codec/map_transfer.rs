@@ -1,5 +1,8 @@
 use std::io::{Read, Cursor};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use serde::{Deserialize, Serialize};
 use flate2::read::ZlibDecoder;
 
 use crate::codec::BinaryReader;
@@ -41,8 +44,133 @@ impl MapTransfer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ParseStage {
+    Init = 0,
+    Prototypes = 1,
+    Entities = 2,
+    Resources = 3,
+    Tiles = 4,
+    Done = 5,
+    Error = 6,
+}
+
+impl ParseStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParseStage::Init => "init",
+            ParseStage::Prototypes => "prototypes",
+            ParseStage::Entities => "entities",
+            ParseStage::Resources => "resources",
+            ParseStage::Tiles => "tiles",
+            ParseStage::Done => "done",
+            ParseStage::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ParseProgress {
+    stage: AtomicU8,
+    entities_total: AtomicUsize,
+    entities_done: AtomicUsize,
+    resources_total: AtomicUsize,
+    resources_done: AtomicUsize,
+    resources_current: AtomicUsize,
+    resources_current_len: AtomicUsize,
+    tiles_total: AtomicUsize,
+    tiles_done: AtomicUsize,
+}
+
+impl ParseProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_stage(&self, stage: ParseStage) {
+        self.stage.store(stage as u8, Ordering::Relaxed);
+    }
+
+    pub fn stage(&self) -> ParseStage {
+        match self.stage.load(Ordering::Relaxed) {
+            1 => ParseStage::Prototypes,
+            2 => ParseStage::Entities,
+            3 => ParseStage::Resources,
+            4 => ParseStage::Tiles,
+            5 => ParseStage::Done,
+            6 => ParseStage::Error,
+            _ => ParseStage::Init,
+        }
+    }
+
+    pub fn set_entities_total(&self, total: usize) {
+        self.entities_total.store(total, Ordering::Relaxed);
+        self.entities_done.store(0, Ordering::Relaxed);
+    }
+
+    pub fn inc_entities_done(&self) {
+        self.entities_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_resources_total(&self, total: usize) {
+        self.resources_total.store(total, Ordering::Relaxed);
+        self.resources_done.store(0, Ordering::Relaxed);
+    }
+
+    pub fn inc_resources_done(&self) {
+        self.resources_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_resources_current(&self, ordinal: usize, len: usize) {
+        self.resources_current.store(ordinal, Ordering::Relaxed);
+        self.resources_current_len.store(len, Ordering::Relaxed);
+    }
+
+    pub fn resources_current(&self) -> usize {
+        self.resources_current.load(Ordering::Relaxed)
+    }
+
+    pub fn resources_current_len(&self) -> usize {
+        self.resources_current_len.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tiles_total(&self, total: usize) {
+        self.tiles_total.store(total, Ordering::Relaxed);
+        self.tiles_done.store(0, Ordering::Relaxed);
+    }
+
+    pub fn inc_tiles_done(&self) {
+        self.tiles_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn entities_done(&self) -> usize {
+        self.entities_done.load(Ordering::Relaxed)
+    }
+
+    pub fn entities_total(&self) -> usize {
+        self.entities_total.load(Ordering::Relaxed)
+    }
+
+    pub fn resources_done(&self) -> usize {
+        self.resources_done.load(Ordering::Relaxed)
+    }
+
+    pub fn resources_total(&self) -> usize {
+        self.resources_total.load(Ordering::Relaxed)
+    }
+
+    pub fn tiles_done(&self) -> usize {
+        self.tiles_done.load(Ordering::Relaxed)
+    }
+
+    pub fn tiles_total(&self) -> usize {
+        self.tiles_total.load(Ordering::Relaxed)
+    }
+}
+
 /// Prototype ID mappings from level.dat0
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrototypeMappings {
     pub tables: HashMap<String, HashMap<u16, String>>,
     pub entity_groups: HashMap<u16, String>,
@@ -61,6 +189,14 @@ impl PrototypeMappings {
         self.tables.get("ItemPrototype")?.get(&id)
     }
 
+    pub fn item_id_by_name(&self, name: &str) -> Option<u16> {
+        self.tables
+            .get("ItemPrototype")?
+            .iter()
+            .find(|(_, item_name)| item_name.as_str() == name)
+            .map(|(id, _)| *id)
+    }
+
     pub fn recipe_name(&self, id: u16) -> Option<&String> {
         self.tables.get("Recipe")?.get(&id)
     }
@@ -77,6 +213,22 @@ impl PrototypeMappings {
             .map(|(id, _)| *id)
     }
 
+    pub fn recipe_id_by_name(&self, name: &str) -> Option<u16> {
+        self.tables
+            .get("Recipe")?
+            .iter()
+            .find(|(_, recipe_name)| recipe_name.as_str() == name)
+            .map(|(id, _)| *id)
+    }
+
+    pub fn technology_id_by_name(&self, name: &str) -> Option<u16> {
+        self.tables
+            .get("Technology")?
+            .iter()
+            .find(|(_, tech_name)| tech_name.as_str() == name)
+            .map(|(id, _)| *id)
+    }
+
     pub fn character_speed(&self) -> f64 {
         0.15
     }
@@ -84,11 +236,49 @@ impl PrototypeMappings {
 
 /// Parse map data from raw bytes
 pub fn parse_map_data(data: &[u8]) -> Result<MapData> {
-    if data.len() >= 4 && &data[0..4] == b"PK\x03\x04" {
-        return parse_zip_map(data);
+    parse_map_data_with_progress(data, None)
+}
+
+pub fn parse_map_data_with_progress(
+    data: &[u8],
+    progress: Option<Arc<ParseProgress>>,
+) -> Result<MapData> {
+    if let Some(p) = progress.as_ref() {
+        p.set_stage(ParseStage::Init);
     }
-    let decompressed = decompress_if_needed(data)?;
-    MapData::parse(&decompressed)
+    let result = if data.len() >= 4 && &data[0..4] == b"PK\x03\x04" {
+        parse_zip_map_with_progress(data, progress.clone())
+    } else {
+        let decompressed = decompress_if_needed(data)?;
+        MapData::parse(&decompressed)
+    };
+    if let Some(p) = progress.as_ref() {
+        p.set_stage(if result.is_ok() { ParseStage::Done } else { ParseStage::Error });
+    }
+    result
+}
+
+pub fn parse_map_resources(data: &[u8]) -> Result<Vec<MapEntity>> {
+    let prev_skip_resources = std::env::var("FACTORIO_SKIP_RESOURCE_PARSE").ok();
+    std::env::remove_var("FACTORIO_SKIP_RESOURCE_PARSE");
+    let prev_skip_tiles = std::env::var("FACTORIO_SKIP_TILE_PARSE").ok();
+    std::env::set_var("FACTORIO_SKIP_TILE_PARSE", "1");
+    let result = parse_map_data(data)
+        .map(|map| {
+            map.entities
+                .into_iter()
+                .filter(|e| e.resource_amount.is_some())
+                .collect()
+        });
+    if let Some(prev) = prev_skip_tiles {
+        std::env::set_var("FACTORIO_SKIP_TILE_PARSE", prev);
+    } else {
+        std::env::remove_var("FACTORIO_SKIP_TILE_PARSE");
+    }
+    if let Some(prev) = prev_skip_resources {
+        std::env::set_var("FACTORIO_SKIP_RESOURCE_PARSE", prev);
+    }
+    result
 }
 
 /// Map deserializer state for delta-encoded positions
@@ -325,8 +515,9 @@ impl MapGenSettings {
         let seed = reader.read_u32_le()?;
         let width = reader.read_u32_le()?;
         let height = reader.read_u32_le()?;
-        #[cfg(test)]
-        eprintln!("  MapGenSettings: seed={}, w={}, h={}, pos={}", seed, width, height, reader.position());
+        if std::env::var("FACTORIO_DEBUG").is_ok() {
+            eprintln!("  [DEBUG] MapGenSettings: seed={}, w={}, h={}, pos={}", seed, width, height, reader.position());
+        }
 
         // 7-12) unknown fields (doc lines 917-922)
         let unknown_0x78 = reader.read_u32_le()?;
@@ -1481,6 +1672,92 @@ fn parse_surface_preludes(reader: &mut BinaryReader, version: &MapVersion) -> Re
     Ok(surfaces)
 }
 
+fn is_surface_prelude_plausible(
+    surfaces: &[SurfacePrelude],
+    map_width: u32,
+    map_height: u32,
+) -> bool {
+    if surfaces.is_empty() {
+        return false;
+    }
+    let (chunks_x, chunks_y) = if map_width > 0 && map_height > 0 {
+        let cx = ((map_width + 31) / 32) as i32;
+        let cy = ((map_height + 31) / 32) as i32;
+        (cx.max(1), cy.max(1))
+    } else {
+        (0, 0)
+    };
+    let expected_chunks = (chunks_x as usize).saturating_mul(chunks_y as usize);
+    let min_chunks = if expected_chunks > 0 {
+        (expected_chunks / 2).max(4)
+    } else {
+        1
+    };
+    let max_x = if chunks_x > 0 { (chunks_x / 2) + 2 } else { 1_000_000 };
+    let max_y = if chunks_y > 0 { (chunks_y / 2) + 2 } else { 1_000_000 };
+    for surface in surfaces {
+        if surface.chunks.len() < min_chunks || surface.chunks.len() > 10_000 {
+            return false;
+        }
+        let mut bad_status = 0usize;
+        for chunk in &surface.chunks {
+            let (x, y) = chunk.position;
+            if x.abs() > max_x || y.abs() > max_y {
+                return false;
+            }
+            if chunk.status > 0x20 {
+                bad_status += 1;
+            }
+        }
+        if bad_status > surface.chunks.len() / 5 {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_surface_preludes(
+    data: &[u8],
+    version: &MapVersion,
+    map_width: u32,
+    map_height: u32,
+) -> Option<(Vec<SurfacePrelude>, usize)> {
+    let debug = std::env::var("FACTORIO_DEBUG").is_ok();
+    let mut best: Option<(Vec<SurfacePrelude>, usize)> = None;
+    let len = data.len();
+    let mut offset = 0usize;
+    while offset + 4 <= len {
+        let surface_count = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        if surface_count == 0 || surface_count > 16 {
+            offset += 4;
+            continue;
+        }
+        let mut reader = BinaryReader::new(&data[offset..]);
+        if let Ok(surfaces) = parse_surface_preludes(&mut reader, version) {
+            if is_surface_prelude_plausible(&surfaces, map_width, map_height) {
+                let consumed = reader.position();
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Found plausible surface prelude at offset={} (consumed={}, surfaces={}, chunks={})",
+                        offset,
+                        consumed,
+                        surfaces.len(),
+                        surfaces.get(0).map(|s| s.chunks.len()).unwrap_or(0)
+                    );
+                }
+                best = Some((surfaces, offset));
+                break;
+            }
+        }
+        offset += 4;
+    }
+    best
+}
 
 fn skip_logistic_supply(reader: &mut BinaryReader) -> Result<()> {
     let count = reader.read_u16_le()? as usize;
@@ -2216,6 +2493,15 @@ impl LevelDatStream {
                 let update_tick = reader.read_u64_le()?;
                 let entity_tick = reader.read_u64_le()?;
                 let ticks_played = reader.read_u64_le()?;
+                if debug {
+                    eprintln!(
+                        "[DEBUG] MapHeader fallback ticks: update={} entity={} played={} pos={}",
+                        update_tick,
+                        entity_tick,
+                        ticks_played,
+                        reader.position()
+                    );
+                }
                 return Self::parse_from_map_header(data, offset, version, update_tick, entity_tick, ticks_played);
             }
             return Err(Error::InvalidPacket("MapHeader tick values invalid".into()));
@@ -2571,23 +2857,40 @@ struct CrossChunkFill {
     tile_id: u16,
 }
 
-fn decode_tile_blob(
-    data: &[u8],
+struct TileDecodeParams<'a> {
+    data: &'a [u8],
     chunk_x: i32,
     chunk_y: i32,
     out_of_map_id: u16,
-    terrain: &TerrainGenerator,
-    prototype_mappings: &PrototypeMappings,
-    prefilled: &[(usize, u16)], // (local_idx, tile_id) from neighbor large tiles
+    terrain: Option<&'a TerrainGenerator>,
+    prototype_mappings: &'a PrototypeMappings,
+    prefilled: &'a [(usize, u16)], // (local_idx, tile_id) from neighbor large tiles
+}
+
+fn decode_tile_blob(
+    params: TileDecodeParams<'_>,
 ) -> Result<(Vec<DecodedTile>, Vec<((i32, i32), CrossChunkFill)>)> {
+    let TileDecodeParams {
+        data,
+        chunk_x,
+        chunk_y,
+        out_of_map_id,
+        terrain,
+        prototype_mappings,
+        prefilled,
+    } = params;
     let mut tile_ids = [out_of_map_id; 1024];
     let mut filled = [false; 1024];
+    let mut filled_count = 0usize;
 
     // Apply pre-fills from neighbor chunks' large tiles
     for &(idx, tile_id) in prefilled {
         if idx < 1024 {
             tile_ids[idx] = tile_id;
-            filled[idx] = true;
+            if !filled[idx] {
+                filled[idx] = true;
+                filled_count += 1;
+            }
         }
     }
 
@@ -2617,7 +2920,10 @@ fn decode_tile_blob(
             remaining -= 1;
 
             tile_ids[idx] = current_tile_id;
-            filled[idx] = true;
+            if !filled[idx] {
+                filled[idx] = true;
+                filled_count += 1;
+            }
 
             let masked = flag & 0xF0;
             let size_index = if masked & 0x10 != 0 {
@@ -2637,7 +2943,10 @@ fn decode_tile_blob(
                         if gx < 32 && gy < 32 {
                             let fidx = gy * 32 + gx;
                             tile_ids[fidx] = current_tile_id;
-                            filled[fidx] = true;
+                            if !filled[fidx] {
+                                filled[fidx] = true;
+                                filled_count += 1;
+                            }
                         } else {
                             // Cross-chunk: compute target chunk and local position
                             let target_cx = chunk_x + (gx / 32) as i32;
@@ -2656,14 +2965,29 @@ fn decode_tile_blob(
         }
     }
 
-    let chunk_tiles = terrain.compute_chunk(chunk_x, chunk_y);
-    let tiles: Vec<DecodedTile> = (0..1024).map(|i| {
-        if filled[i] {
-            DecodedTile::FromSave(tile_ids[i])
-        } else {
-            DecodedTile::Procedural(terrain.tile_name(chunk_tiles[i]).to_string())
-        }
-    }).collect();
+    let skip_procedural = std::env::var("FACTORIO_SKIP_PROCEDURAL_TILES").is_ok();
+    let tiles: Vec<DecodedTile> = if filled_count == 1024 || skip_procedural || terrain.is_none() {
+        (0..1024)
+            .map(|i| {
+                if filled[i] {
+                    DecodedTile::FromSave(tile_ids[i])
+                } else {
+                    DecodedTile::FromSave(out_of_map_id)
+                }
+            })
+            .collect()
+    } else {
+        let chunk_tiles = terrain.unwrap().compute_chunk(chunk_x, chunk_y);
+        (0..1024)
+            .map(|i| {
+                if filled[i] {
+                    DecodedTile::FromSave(tile_ids[i])
+                } else {
+                    DecodedTile::Procedural(terrain.unwrap().tile_name(chunk_tiles[i]).to_string())
+                }
+            })
+            .collect()
+    };
 
     Ok((tiles, cross_chunk_fills))
 }
@@ -2676,6 +3000,9 @@ fn scan_for_entities(
     entity_prototypes: &HashMap<u16, String>,
     entity_groups: &HashMap<u16, String>,
     chunk_positions: Option<&Vec<ChunkPrelude>>,
+    _map_width: u32,
+    _map_height: u32,
+    progress: Option<Arc<ParseProgress>>,
 ) -> Vec<MapEntity> {
     let debug = std::env::var("FACTORIO_DEBUG").is_ok();
     let mut all_entities = Vec::new();
@@ -2683,11 +3010,12 @@ fn scan_for_entities(
     let mut chunks_failed = 0usize;
 
     // Find all chunk starts (entity data begins after "/T")
-    let mut chunk_starts = Vec::new(); // (byte_offset, entity_start)
+    let mut chunk_starts = Vec::new(); // (byte_offset, entity_start, chunk_index)
     for i in 0..data.len().saturating_sub(10) {
         if data[i] != 0x43 || data[i + 1] != 0x3a {
             continue;
         }
+        let chunk_index = u32::from_le_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]) as usize;
         let tile_blob_len = u16::from_le_bytes([data[i + 6], data[i + 7]]) as usize;
         if tile_blob_len == 0 || tile_blob_len > 0x1000 {
             continue;
@@ -2699,16 +3027,20 @@ fn scan_for_entities(
         if data[tile_end] != 0x2f || data[tile_end + 1] != 0x54 {
             continue;
         }
-        chunk_starts.push((i, tile_end + 2));
+        chunk_starts.push((i, tile_end + 2, chunk_index));
     }
 
-    chunk_starts.sort_by_key(|(start, _)| *start);
+    chunk_starts.sort_by_key(|(start, _, _)| *start);
+    if let Some(p) = progress.as_ref() {
+        p.set_stage(ParseStage::Entities);
+        p.set_entities_total(chunk_starts.len());
+    }
 
     for ordinal in 0..chunk_starts.len() {
-        let (_chunk_start, entity_start) = chunk_starts[ordinal];
+        let (_chunk_start, entity_start, chunk_index) = chunk_starts[ordinal];
         // Entity section extends to the next chunk's "C:" or end of data
         let entity_end = chunk_starts.get(ordinal + 1)
-            .map(|(next_start, _)| *next_start)
+            .map(|(next_start, _, _)| *next_start)
             .unwrap_or(data.len());
 
         let (chunk_x, chunk_y) = chunk_positions
@@ -2746,8 +3078,14 @@ fn scan_for_entities(
                     col_x2: cbox[2],
                     col_y2: cbox[3],
                     collides_player: collides,
+                    resource_amount: result.resource_amount,
+                    resource_infinite: result.resource_infinite,
+                    underground_type: result.underground_type,
                 });
             }
+        }
+        if let Some(p) = progress.as_ref() {
+            p.inc_entities_done();
         }
     }
 
@@ -2761,6 +3099,368 @@ fn scan_for_entities(
     all_entities
 }
 
+fn scan_for_resources(
+    data: &[u8],
+    entity_prototypes: &HashMap<u16, String>,
+    entity_groups: &HashMap<u16, String>,
+    chunk_positions: Option<&Vec<ChunkPrelude>>,
+    map_width: u32,
+    map_height: u32,
+    progress: Option<Arc<ParseProgress>>,
+) -> Vec<MapEntity> {
+    let mut all_entities = Vec::new();
+    let debug = std::env::var("FACTORIO_DEBUG").is_ok();
+    let max_scan = std::env::var("FACTORIO_RESOURCE_SCAN_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(65_536);
+    let resource_ids: Vec<u16> = entity_groups
+        .iter()
+        .filter_map(|(id, group)| if group == "resource" { Some(*id) } else { None })
+        .collect();
+    if resource_ids.is_empty() {
+        return all_entities;
+    }
+    let resource_set: std::collections::HashSet<u16> = resource_ids.iter().copied().collect();
+
+    // Find all chunk starts (entity data begins after "/T")
+    let mut chunk_starts = Vec::new(); // (byte_offset, entity_start, chunk_index)
+    for i in 0..data.len().saturating_sub(10) {
+        if data[i] != 0x43 || data[i + 1] != 0x3a {
+            continue;
+        }
+        let chunk_index = u32::from_le_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]) as usize;
+        let tile_blob_len = u16::from_le_bytes([data[i + 6], data[i + 7]]) as usize;
+        if tile_blob_len == 0 || tile_blob_len > 0x1000 {
+            continue;
+        }
+        let tile_end = i + 8 + tile_blob_len;
+        if tile_end + 2 > data.len() {
+            continue;
+        }
+        if data[tile_end] != 0x2f || data[tile_end + 1] != 0x54 {
+            continue;
+        }
+        chunk_starts.push((i, tile_end + 2, chunk_index));
+    }
+    chunk_starts.sort_by_key(|(start, _, _)| *start);
+    if let Some(p) = progress.as_ref() {
+        p.set_stage(ParseStage::Resources);
+        p.set_resources_total(chunk_starts.len());
+    }
+
+    let mut existing: std::collections::HashSet<(String, i32, i32)> = std::collections::HashSet::new();
+    for entity in scan_for_entities(
+        data,
+        entity_prototypes,
+        entity_groups,
+        chunk_positions,
+        map_width,
+        map_height,
+        None,
+    ) {
+        if entity.resource_amount.is_some() {
+            existing.insert((entity.name.clone(), entity.x.floor() as i32, entity.y.floor() as i32));
+        }
+    }
+
+    let mut cached_id_offset: Option<usize> = None;
+    let mut cached_amount_offset: Option<usize> = None;
+
+    for ordinal in 0..chunk_starts.len() {
+        let (_chunk_start, entity_start, chunk_index) = chunk_starts[ordinal];
+        let entity_end = chunk_starts
+            .get(ordinal + 1)
+            .map(|(next_start, _, _)| *next_start)
+            .unwrap_or(data.len());
+
+        let (chunk_x, chunk_y) = chunk_positions
+            .and_then(|positions| positions.get(ordinal))
+            .map(|chunk| chunk.position)
+            .unwrap_or_else(|| {
+                let total = chunk_starts.len();
+                let side = (total as f64).sqrt().ceil() as i32;
+                let half = side / 2;
+                ((ordinal as i32 / side) - half, (ordinal as i32 % side) - half)
+            });
+
+        let entity_data = &data[entity_start..entity_end];
+        if let Some(p) = progress.as_ref() {
+            p.set_resources_current(ordinal, entity_data.len());
+        }
+        if entity_data.len() < 2048 {
+            if let Some(p) = progress.as_ref() {
+                p.inc_resources_done();
+            }
+            continue;
+        }
+
+        let mut best_offset = None;
+        let mut best_count = 0usize;
+        let mut best_valid = 0usize;
+        let search_limit = entity_data.len().min(8192);
+
+        let mut try_offset = |offset: usize| -> Option<(usize, usize, usize)> {
+            if offset + 2048 > entity_data.len() {
+                return None;
+            }
+            let mut valid = 0usize;
+            let mut count = 0usize;
+            for i in 0..1024usize {
+                let idx = offset + i * 2;
+                let val = u16::from_le_bytes([entity_data[idx], entity_data[idx + 1]]);
+                if val == 0 || resource_set.contains(&val) {
+                    valid += 1;
+                }
+                if resource_set.contains(&val) {
+                    count += 1;
+                }
+            }
+            Some((offset, valid, count))
+        };
+
+        if let Some(cached) = cached_id_offset {
+            if let Some((_offset, valid, count)) = try_offset(cached) {
+                if valid >= 1010 && count >= 16 {
+                    best_offset = Some(cached);
+                    best_valid = valid;
+                    best_count = count;
+                }
+            }
+        }
+
+        if best_offset.is_none() {
+            for offset in (0..=search_limit.saturating_sub(2048)).step_by(2) {
+                if let Some((_offset, valid, count)) = try_offset(offset) {
+                    if valid >= 1010 && count > best_count {
+                        best_valid = valid;
+                        best_count = count;
+                        best_offset = Some(offset);
+                    }
+                    if best_valid >= 1020 && best_count >= 32 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if best_offset.is_none() && search_limit < entity_data.len() {
+            let upper = entity_data.len().min(max_scan);
+            if upper > search_limit {
+                for offset in (search_limit..=upper.saturating_sub(2048)).step_by(2) {
+                    if let Some((_offset, valid, count)) = try_offset(offset) {
+                        if valid >= 1010 && count > best_count {
+                            best_valid = valid;
+                            best_count = count;
+                            best_offset = Some(offset);
+                        }
+                        if best_valid >= 1020 && best_count >= 32 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if debug && upper < entity_data.len() {
+                eprintln!(
+                    "[RES] chunk {} scan capped at {} bytes (len={})",
+                    ordinal, upper, entity_data.len()
+                );
+            }
+        }
+
+        let Some(offset) = best_offset else {
+            if let Some(p) = progress.as_ref() {
+                p.inc_resources_done();
+            }
+            continue;
+        };
+        cached_id_offset = Some(offset);
+
+        // Heuristic: search for a parallel u32 amount layer near the id layer
+        let mut amount_offset = None;
+        let mut best_amount_score = 0usize;
+        if let Some(cached) = cached_amount_offset {
+            if cached + 4096 <= entity_data.len() {
+                let mut score = 0usize;
+                for i in 0..1024usize {
+                    let id_idx = offset + i * 2;
+                    let val_idx = cached + i * 4;
+                    let id = u16::from_le_bytes([entity_data[id_idx], entity_data[id_idx + 1]]);
+                    let val = u32::from_le_bytes([
+                        entity_data[val_idx],
+                        entity_data[val_idx + 1],
+                        entity_data[val_idx + 2],
+                        entity_data[val_idx + 3],
+                    ]);
+                    let plausible = val == 0 || (val >= 1 && val <= 10_000_000);
+                    if !plausible {
+                        score = 0;
+                        break;
+                    }
+                    if id == 0 {
+                        if val == 0 {
+                            score += 1;
+                        }
+                    } else if resource_set.contains(&id) && val > 0 {
+                        score += 1;
+                    }
+                }
+                if score >= 900 {
+                    amount_offset = Some(cached);
+                    best_amount_score = score;
+                }
+            }
+        }
+
+        if amount_offset.is_none() {
+            let search_len = entity_data.len().min(8192);
+            for cand in (0..search_len.saturating_sub(4096)).step_by(4) {
+                if cand + 4096 > entity_data.len() {
+                    break;
+                }
+                let mut score = 0usize;
+                for i in 0..1024usize {
+                    let id_idx = offset + i * 2;
+                    let val_idx = cand + i * 4;
+                    let id = u16::from_le_bytes([entity_data[id_idx], entity_data[id_idx + 1]]);
+                    let val = u32::from_le_bytes([
+                        entity_data[val_idx],
+                        entity_data[val_idx + 1],
+                        entity_data[val_idx + 2],
+                        entity_data[val_idx + 3],
+                    ]);
+                    let plausible = val == 0 || (val >= 1 && val <= 10_000_000);
+                    if !plausible {
+                        score = 0;
+                        break;
+                    }
+                    if id == 0 {
+                        if val == 0 {
+                            score += 1;
+                        }
+                    } else if resource_set.contains(&id) && val > 0 {
+                        score += 1;
+                    }
+                }
+                if score > best_amount_score {
+                    best_amount_score = score;
+                    amount_offset = Some(cand);
+                }
+                if best_amount_score > 1000 {
+                    break;
+                }
+            }
+        }
+
+        if amount_offset.is_none() && entity_data.len() > 8192 {
+            let upper = entity_data.len().min(max_scan);
+            if upper > 8192 {
+                for cand in (8192..upper.saturating_sub(4096)).step_by(4) {
+                    if cand + 4096 > entity_data.len() {
+                        break;
+                    }
+                    let mut score = 0usize;
+                    for i in 0..1024usize {
+                        let id_idx = offset + i * 2;
+                        let val_idx = cand + i * 4;
+                        let id = u16::from_le_bytes([entity_data[id_idx], entity_data[id_idx + 1]]);
+                        let val = u32::from_le_bytes([
+                            entity_data[val_idx],
+                            entity_data[val_idx + 1],
+                            entity_data[val_idx + 2],
+                            entity_data[val_idx + 3],
+                        ]);
+                        let plausible = val == 0 || (val >= 1 && val <= 10_000_000);
+                        if !plausible {
+                            score = 0;
+                            break;
+                        }
+                        if id == 0 {
+                            if val == 0 {
+                                score += 1;
+                            }
+                        } else if resource_set.contains(&id) && val > 0 {
+                            score += 1;
+                        }
+                    }
+                    if score > best_amount_score {
+                        best_amount_score = score;
+                        amount_offset = Some(cand);
+                    }
+                    if best_amount_score > 1000 {
+                        break;
+                    }
+                }
+            }
+            if debug && upper < entity_data.len() {
+                eprintln!(
+                    "[RES] chunk {} amount scan capped at {} bytes (len={})",
+                    ordinal, upper, entity_data.len()
+                );
+            }
+        }
+
+        if let Some(found) = amount_offset {
+            cached_amount_offset = Some(found);
+        }
+        if best_amount_score < 900 {
+            amount_offset = None;
+        }
+        for i in 0..1024usize {
+            let idx = offset + i * 2;
+            let val = u16::from_le_bytes([entity_data[idx], entity_data[idx + 1]]);
+            if !resource_set.contains(&val) {
+                continue;
+            }
+            let name = entity_prototypes
+                .get(&val)
+                .cloned()
+                .unwrap_or_else(|| format!("resource-{}", val));
+            let local_x = (i % 32) as i32;
+            let local_y = (i / 32) as i32;
+            let tile_x = chunk_x * 32 + local_x;
+            let tile_y = chunk_y * 32 + local_y;
+            let x = tile_x as f64 + 0.5;
+            let y = tile_y as f64 + 0.5;
+            if existing.contains(&(name.clone(), tile_x, tile_y)) {
+                continue;
+            }
+            let amount = amount_offset.and_then(|ao| {
+                let val_idx = ao + i * 4;
+                if val_idx + 4 <= entity_data.len() {
+                    Some(u32::from_le_bytes([
+                        entity_data[val_idx],
+                        entity_data[val_idx + 1],
+                        entity_data[val_idx + 2],
+                        entity_data[val_idx + 3],
+                    ]))
+                } else {
+                    None
+                }
+            }).filter(|v| *v > 0).unwrap_or(1000);
+            let (cbox, collides) = entity_collision_box(&name);
+            all_entities.push(MapEntity {
+                name,
+                x,
+                y,
+                direction: 0,
+                col_x1: cbox[0],
+                col_y1: cbox[1],
+                col_x2: cbox[2],
+                col_y2: cbox[3],
+                collides_player: collides,
+                resource_amount: Some(amount),
+                resource_infinite: false,
+                underground_type: None,
+            });
+        }
+        if let Some(p) = progress.as_ref() {
+            p.inc_resources_done();
+        }
+    }
+
+    all_entities
+}
 /// Scan for tile data by finding "/T" markers and working backwards
 fn scan_for_tiles(
     data: &[u8],
@@ -2768,6 +3468,9 @@ fn scan_for_tiles(
     chunk_positions: Option<&Vec<ChunkPrelude>>,
     seed: u32,
     autoplace_controls: &HashMap<String, FrequencySizeRichness>,
+    _map_width: u32,
+    _map_height: u32,
+    progress: Option<Arc<ParseProgress>>,
 ) -> Vec<MapTile> {
     let debug = std::env::var("FACTORIO_DEBUG").is_ok();
     let mut all_tiles = Vec::new();
@@ -2793,11 +3496,16 @@ fn scan_for_tiles(
         controls.insert(format!("control:{}:size", name), fsr.size);
     }
 
-    let terrain = match TerrainGenerator::new_with_controls(seed, &controls) {
-        Ok(gen) => gen,
-        Err(e) => {
-            eprintln!("Failed to create TerrainGenerator: {}", e);
-            return Vec::new();
+    let skip_procedural = std::env::var("FACTORIO_SKIP_PROCEDURAL_TILES").is_ok();
+    let terrain = if skip_procedural {
+        None
+    } else {
+        match TerrainGenerator::new_with_controls(seed, &controls) {
+            Ok(gen) => Some(gen),
+            Err(e) => {
+                eprintln!("Failed to create TerrainGenerator: {}", e);
+                return Vec::new();
+            }
         }
     };
 
@@ -2855,6 +3563,10 @@ fn scan_for_tiles(
     tile_chunks.sort_by_key(|(chunk_start, _, _, _)| *chunk_start);
 
     let total_chunks = tile_chunks.len();
+    if let Some(p) = progress.as_ref() {
+        p.set_stage(ParseStage::Tiles);
+        p.set_tiles_total(total_chunks);
+    }
 
     // Cross-chunk fill map: positions pre-filled by previous chunks' large tiles
     let mut cross_chunk_map: std::collections::HashMap<(i32, i32), Vec<(usize, u16)>> =
@@ -2878,6 +3590,9 @@ fn scan_for_tiles(
             .unwrap_or(true);
         if !should_render {
             skipped_not_ready += 1;
+            if let Some(p) = progress.as_ref() {
+                p.inc_tiles_done();
+            }
             continue;
         }
 
@@ -2898,7 +3613,16 @@ fn scan_for_tiles(
 
         let prefilled = cross_chunk_map.remove(&(chunk_x, chunk_y)).unwrap_or_default();
         let status = from_prelude.map(|chunk| chunk.status).unwrap_or(0);
-        match decode_tile_blob(tile_blob, chunk_x, chunk_y, out_of_map_id, &terrain, prototype_mappings, &prefilled) {
+        let params = TileDecodeParams {
+            data: tile_blob,
+            chunk_x,
+            chunk_y,
+            out_of_map_id,
+            terrain: terrain.as_ref(),
+            prototype_mappings,
+            prefilled: &prefilled,
+        };
+        match decode_tile_blob(params) {
         Ok((chunk_tiles, cross_fills)) => {
             for ((target_cx, target_cy), fill) in cross_fills {
                 cross_chunk_map.entry((target_cx, target_cy))
@@ -2947,6 +3671,9 @@ fn scan_for_tiles(
             );
         }
         }
+        if let Some(p) = progress.as_ref() {
+            p.inc_tiles_done();
+        }
     }
 
     // Count tiles by type
@@ -2975,18 +3702,107 @@ fn scan_for_tiles(
     all_tiles
 }
 
+fn collect_tile_chunk_indices(data: &[u8]) -> Vec<u32> {
+    let mut indices = Vec::new();
+    if data.len() < 10 {
+        return indices;
+    }
+
+    for i in 0..data.len().saturating_sub(10) {
+        if data[i] != 0x43 || data[i + 1] != 0x3a {
+            continue;
+        }
+
+        let idx = u32::from_le_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]);
+        let tile_blob_len = u16::from_le_bytes([data[i + 6], data[i + 7]]) as usize;
+        if tile_blob_len == 0 || tile_blob_len > 0x1000 {
+            continue;
+        }
+
+        let tile_end = i + 8 + tile_blob_len;
+        if tile_end + 2 > data.len() {
+            continue;
+        }
+        if data[tile_end] != 0x2f || data[tile_end + 1] != 0x54 {
+            continue;
+        }
+
+        indices.push(idx);
+    }
+
+    indices
+}
+
+fn derive_chunk_grid_from_indices(indices: &[u32]) -> Option<(u32, u32)> {
+    if indices.is_empty() {
+        return None;
+    }
+
+    let mut min_idx = u32::MAX;
+    let mut max_idx = 0u32;
+    let mut unique = std::collections::HashSet::new();
+    for &idx in indices {
+        min_idx = min_idx.min(idx);
+        max_idx = max_idx.max(idx);
+        unique.insert(idx);
+    }
+
+    if unique.is_empty() {
+        return None;
+    }
+
+    let total = if min_idx == 0 && unique.len() as u32 == max_idx + 1 {
+        max_idx + 1
+    } else {
+        unique.len() as u32
+    };
+    if total == 0 {
+        return None;
+    }
+
+    let root = (total as f64).sqrt().round() as u32;
+    if root > 0 && root * root == total {
+        return Some((root, root));
+    }
+
+    let width = (total as f64).sqrt().ceil() as u32;
+    let height = (total + width - 1) / width;
+    Some((width.max(1), height.max(1)))
+}
+
 // ============================================================================
 // ZIP parsing
 // ============================================================================
 fn parse_zip_map(data: &[u8]) -> Result<MapData> {
+    parse_zip_map_with_progress(data, None)
+}
+
+fn parse_zip_map_with_progress(
+    data: &[u8],
+    progress: Option<Arc<ParseProgress>>,
+) -> Result<MapData> {
     let cursor = Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| Error::InvalidPacket(format!("ZIP error: {}", e)))?;
 
     let mut file_names = Vec::new();
+    let mut mapgen_json: Option<String> = None;
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
             file_names.push(file.name().to_string());
+        }
+    }
+    for i in 0..archive.len() {
+        let mut file = match archive.by_index(i) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if file.name().ends_with("map-gen-settings.json") {
+            let mut buf = String::new();
+            if std::io::Read::read_to_string(&mut file, &mut buf).is_ok() {
+                mapgen_json = Some(buf);
+            }
+            break;
         }
     }
 
@@ -3006,6 +3822,25 @@ fn parse_zip_map(data: &[u8]) -> Result<MapData> {
         .flat_map(|(_, data)| data)
         .collect();
 
+    // Read level-init.dat (contains chunk data in newer saves)
+    let mut level_init_data: Option<Vec<u8>> = None;
+    for i in 0..archive.len() {
+        let mut file = match archive.by_index(i) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if file.name().ends_with("level-init.dat") {
+            let mut buf = Vec::new();
+            if std::io::Read::read_to_end(&mut file, &mut buf).is_ok() {
+                level_init_data = Some(buf);
+            }
+            break;
+        }
+    }
+
+    if let Some(p) = progress.as_ref() {
+        p.set_stage(ParseStage::Prototypes);
+    }
     let mut stream = match LevelDatStream::parse(&full_stream) {
         Ok(s) => s,
         Err(e) => return Err(e),
@@ -3025,41 +3860,278 @@ fn parse_zip_map(data: &[u8]) -> Result<MapData> {
 
     let mut surface_reader = BinaryReader::new(&full_stream[stream.end_position..]);
     let mut surface_preludes = parse_surface_preludes(&mut surface_reader, &stream.version)?;
+    if !surface_preludes.is_empty()
+        && !is_surface_prelude_plausible(&surface_preludes, stream.map_width, stream.map_height)
+    {
+        surface_preludes.clear();
+    }
+    let scan_surface = std::env::var("FACTORIO_SCAN_SURFACE_PRELUDE").is_ok();
+    if surface_preludes.is_empty() && scan_surface {
+        if let Some((found, offset)) =
+            find_surface_preludes(&full_stream, &stream.version, stream.map_width, stream.map_height)
+        {
+            let debug = std::env::var("FACTORIO_DEBUG").is_ok();
+            if debug {
+                eprintln!(
+                    "[DEBUG] Using scanned surface prelude at offset={} (was empty at end_position={})",
+                    offset,
+                    stream.end_position
+                );
+            }
+            surface_preludes = found;
+        }
+    }
 
     let entity_prototypes = stream.prototype_mappings.tables.get("Entity").cloned().unwrap_or_default();
     let item_prototypes = stream.prototype_mappings.tables.get("ItemPrototype").cloned().unwrap_or_default();
     let recipe_prototypes = stream.prototype_mappings.tables.get("Recipe").cloned().unwrap_or_default();
 
-    let seed = stream.seed;
+    let mut seed = stream.seed;
+    let mut map_width = stream.map_width;
+    let mut map_height = stream.map_height;
+    let mut map_controls = HashMap::new();
+    for (name, fsr) in &stream.autoplace_controls {
+        map_controls.insert(format!("control:{}:frequency", name), fsr.frequency);
+        map_controls.insert(format!("control:{}:size", name), fsr.size);
+        map_controls.insert(format!("control:{}:richness", name), fsr.richness);
+    }
+
+    if let Some(json_str) = mapgen_json.as_deref() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(s) = value.get("seed").and_then(|v| v.as_i64()) {
+                if s >= 0 && s <= u32::MAX as i64 {
+                    seed = s as u32;
+                } else if s < 0 {
+                    seed = (s as i32) as u32;
+                }
+            }
+            if let Some(w) = value.get("width").and_then(|v| v.as_u64()) {
+                map_width = w as u32;
+            }
+            if let Some(h) = value.get("height").and_then(|v| v.as_u64()) {
+                map_height = h as u32;
+            }
+            if let Some(controls) = value.get("autoplace_controls").and_then(|v| v.as_object()) {
+                for (name, obj) in controls {
+                    if let Some(o) = obj.as_object() {
+                        if let Some(freq) = o.get("frequency").and_then(|v| v.as_f64()) {
+                            map_controls.insert(format!("control:{}:frequency", name), freq as f32);
+                        }
+                        if let Some(size) = o.get("size").and_then(|v| v.as_f64()) {
+                            map_controls.insert(format!("control:{}:size", name), size as f32);
+                        }
+                        if let Some(rich) = o.get("richness").and_then(|v| v.as_f64()) {
+                            map_controls.insert(format!("control:{}:richness", name), rich as f32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if std::env::var("FACTORIO_DEBUG").is_ok() {
+        eprintln!(
+            "[MAP] Seed selection: stream_seed={} json_seed={} final_seed={}",
+            stream.seed,
+            mapgen_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("seed").and_then(|v| v.as_i64()))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            seed
+        );
+    }
     if seed != 0 {
         eprintln!("[MAP] Using map seed {} for procedural terrain", seed);
     }
 
-    let first_surface_positions = surface_preludes.get(0).map(|s| &s.chunks);
+    let full_chunk_indices = collect_tile_chunk_indices(&full_stream);
+    let full_has_chunks = !full_chunk_indices.is_empty();
+    let init_chunk_indices = level_init_data
+        .as_ref()
+        .map(|init| collect_tile_chunk_indices(init))
+        .unwrap_or_default();
 
-    let entities = scan_for_entities(
-        &full_stream,
-        &entity_prototypes,
-        &stream.prototype_mappings.entity_groups,
-        first_surface_positions,
-    );
-    let mut tiles = scan_for_tiles(
-        &full_stream,
-        &stream.prototype_mappings,
-        first_surface_positions,
-        seed,
-        &stream.autoplace_controls,
-    );
+    // Prefer level.dat for entities/resources. Only use level-init for tiles if level.dat has none.
+    let use_init_tiles = !full_has_chunks && !init_chunk_indices.is_empty();
+    let tile_indices = if use_init_tiles {
+        init_chunk_indices
+    } else {
+        full_chunk_indices
+    };
+
+    let full_stream_arc = Arc::new(full_stream);
+    let tile_stream_arc = if use_init_tiles {
+        Arc::new(level_init_data.take().unwrap_or_default())
+    } else {
+        full_stream_arc.clone()
+    };
+
+    if std::env::var("FACTORIO_DEBUG").is_ok() {
+        eprintln!(
+            "[DEBUG] Tile stream: {} bytes, tile_chunks={} (level-init={})",
+            tile_stream_arc.len(),
+            tile_indices.len(),
+            use_init_tiles
+        );
+    }
+
+    let chunk_grid = derive_chunk_grid_from_indices(&tile_indices);
+    if let Some((chunks_x, chunks_y)) = chunk_grid {
+        if std::env::var("FACTORIO_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] Derived chunk grid from tiles: {}x{} (chunks)",
+                chunks_x, chunks_y
+            );
+        }
+    }
+
+    let first_surface_positions = surface_preludes.get(0).map(|s| s.chunks.clone());
+
+    let skip_resources = std::env::var("FACTORIO_SKIP_RESOURCE_PARSE").is_ok();
+    let skip_tiles = std::env::var("FACTORIO_SKIP_TILE_PARSE").is_ok();
+    let parallel = std::env::var("FACTORIO_DISABLE_PARALLEL_MAP_PARSE").is_err();
+
+    let (mut entities, mut tiles) = if parallel {
+        let resource_stream_arc = if !full_has_chunks {
+            tile_stream_arc.clone()
+        } else {
+            full_stream_arc.clone()
+        };
+
+        let progress_clone = progress.clone();
+        let entity_prototypes_clone = entity_prototypes.clone();
+        let entity_groups_clone = stream.prototype_mappings.entity_groups.clone();
+        let surface_positions_clone = first_surface_positions.clone();
+        let map_width_copy = map_width;
+        let map_height_copy = map_height;
+
+        let entities_handle = std::thread::spawn(move || {
+            scan_for_entities(
+                full_stream_arc.as_slice(),
+                &entity_prototypes_clone,
+                &entity_groups_clone,
+                surface_positions_clone.as_ref(),
+                map_width_copy,
+                map_height_copy,
+                progress_clone,
+            )
+        });
+
+        let resources_handle = if skip_resources {
+            None
+        } else {
+            let progress_clone = progress.clone();
+            let entity_prototypes_clone = entity_prototypes.clone();
+            let entity_groups_clone = stream.prototype_mappings.entity_groups.clone();
+            let surface_positions_clone = first_surface_positions.clone();
+            let map_width_copy = map_width;
+            let map_height_copy = map_height;
+            Some(std::thread::spawn(move || {
+                scan_for_resources(
+                    resource_stream_arc.as_slice(),
+                    &entity_prototypes_clone,
+                    &entity_groups_clone,
+                    surface_positions_clone.as_ref(),
+                    map_width_copy,
+                    map_height_copy,
+                    progress_clone,
+                )
+            }))
+        };
+
+        let tiles_handle = if skip_tiles {
+            None
+        } else {
+            let progress_clone = progress.clone();
+            let prototype_mappings = stream.prototype_mappings.clone();
+            let autoplace_controls = stream.autoplace_controls.clone();
+            let surface_positions_clone = first_surface_positions.clone();
+            let seed_copy = seed;
+            let map_width_copy = map_width;
+            let map_height_copy = map_height;
+            Some(std::thread::spawn(move || {
+                scan_for_tiles(
+                    tile_stream_arc.as_slice(),
+                    &prototype_mappings,
+                    surface_positions_clone.as_ref(),
+                    seed_copy,
+                    &autoplace_controls,
+                    map_width_copy,
+                    map_height_copy,
+                    progress_clone,
+                )
+            }))
+        };
+
+        let mut entities = entities_handle.join().unwrap_or_default();
+        if let Some(handle) = resources_handle {
+            if let Ok(resource_entities) = handle.join() {
+                entities.extend(resource_entities);
+            }
+        }
+        let tiles = match tiles_handle {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => Vec::new(),
+        };
+        (entities, tiles)
+    } else {
+        let entities = scan_for_entities(
+            full_stream_arc.as_slice(),
+            &entity_prototypes,
+            &stream.prototype_mappings.entity_groups,
+            first_surface_positions.as_ref(),
+            map_width,
+            map_height,
+            progress.clone(),
+        );
+        let mut entities = entities;
+        if !skip_resources {
+            let resource_stream = if !full_has_chunks {
+                tile_stream_arc.as_slice()
+            } else {
+                full_stream_arc.as_slice()
+            };
+            let resource_entities = scan_for_resources(
+                resource_stream,
+                &entity_prototypes,
+                &stream.prototype_mappings.entity_groups,
+                first_surface_positions.as_ref(),
+                map_width,
+                map_height,
+                progress.clone(),
+            );
+            entities.extend(resource_entities);
+        }
+        let tiles = if skip_tiles {
+            Vec::new()
+        } else {
+            scan_for_tiles(
+                tile_stream_arc.as_slice(),
+                &stream.prototype_mappings,
+                first_surface_positions.as_ref(),
+                seed,
+                &stream.autoplace_controls,
+                map_width,
+                map_height,
+                progress.clone(),
+            )
+        };
+        (entities, tiles)
+    };
 
     // Discard tiles outside the known map bounds
-    let half_w = (stream.map_width / 2) as i32;
-    let half_h = (stream.map_height / 2) as i32;
-    if half_w > 0 && half_h > 0 {
-        let before = tiles.len();
-        tiles.retain(|t| t.x >= -half_w && t.x < half_w && t.y >= -half_h && t.y < half_h);
-        let removed = before - tiles.len();
-        if removed > 0 {
-            eprintln!("[TILES] Filtered {} tiles outside map bounds (±{}, ±{})", removed, half_w, half_h);
+    if !skip_tiles {
+        let half_w = (map_width / 2) as i32;
+        let half_h = (map_height / 2) as i32;
+        if half_w > 0 && half_h > 0 {
+            let before = tiles.len();
+            tiles.retain(|t| t.x >= -half_w && t.x < half_w && t.y >= -half_h && t.y < half_h);
+            let removed = before - tiles.len();
+            if removed > 0 {
+                eprintln!("[TILES] Filtered {} tiles outside map bounds (±{}, ±{})", removed, half_w, half_h);
+            }
         }
     }
 
@@ -3090,6 +4162,9 @@ fn parse_zip_map(data: &[u8]) -> Result<MapData> {
         scenario_mod: String::new(),
         seed,
         ticks_played: stream.ticks_played as u32,
+        map_width,
+        map_height,
+        map_controls,
         entities,
         tiles,
         player_spawn: (0.0, 0.0),
@@ -3144,13 +4219,16 @@ fn decompress_if_needed(data: &[u8]) -> Result<Vec<u8>> {
 // ============================================================================
 
 /// Parsed map data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapData {
     pub version: MapVersion,
     pub scenario_name: String,
     pub scenario_mod: String,
     pub seed: u32,
     pub ticks_played: u32,
+    pub map_width: u32,
+    pub map_height: u32,
+    pub map_controls: HashMap<String, f32>,
     pub entities: Vec<MapEntity>,
     pub tiles: Vec<MapTile>,
     pub player_spawn: (f64, f64),
@@ -3191,6 +4269,9 @@ impl MapData {
             scenario_mod,
             seed,
             ticks_played,
+            map_width: 0,
+            map_height: 0,
+            map_controls: HashMap::new(),
             entities: Vec::new(),
             tiles: Vec::new(),
             player_spawn: (0.0, 0.0),

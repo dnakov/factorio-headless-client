@@ -365,6 +365,7 @@ pub struct ConnectionAcceptOrDeny {
     pub initial_tick: Option<u32>,
     pub initial_msg_id: Option<u16>,
     pub session_constant: Option<u16>,
+    pub latency: Option<u8>,
     // New fields from binary RE
     pub peer_count: Option<u8>,
     pub map_tick: Option<u32>,
@@ -394,14 +395,15 @@ impl ConnectionAcceptOrDeny {
                     peer_id: None,
                     player_index: Some(player_index),
                     server_name: Some(server_name),
-                    denial_reason: None,
-                    initial_tick: None,
-                    initial_msg_id: None,
-                    session_constant: None,
-                    peer_count: None,
-                    map_tick: None,
-                    steam_id: None,
-                    latency_window: None,
+                denial_reason: None,
+                initial_tick: None,
+                initial_msg_id: None,
+                session_constant: None,
+                latency: None,
+                peer_count: None,
+                map_tick: None,
+                steam_id: None,
+                latency_window: None,
                 });
             }
         }
@@ -416,6 +418,7 @@ impl ConnectionAcceptOrDeny {
             initial_tick: None,
             initial_msg_id: None,
             session_constant: None,
+            latency: None,
             peer_count: None,
             map_tick: None,
             steam_id: None,
@@ -563,58 +566,23 @@ impl TransferBlock {
 #[derive(Debug, Clone)]
 pub struct ClientToServerHeartbeat {
     pub flags: u8,
-    pub msg_id: u16,
-    pub peer_constant: u16,
-    pub client_tick: u32,
-    pub server_tick_echo: u32,
+    pub heartbeat_sequence: u32,
+    pub tick: u64,
 }
 
 impl ClientToServerHeartbeat {
-    pub fn new(flags: u8, msg_id: u16, peer_constant: u16, client_tick: u32, server_tick_echo: u32) -> Self {
+    pub fn new(flags: u8, heartbeat_sequence: u32, tick: u64) -> Self {
         Self {
             flags,
-            msg_id,
-            peer_constant,
-            client_tick,
-            server_tick_echo,
+            heartbeat_sequence,
+            tick,
         }
     }
 
     pub fn write(&self, writer: &mut BinaryWriter) {
         writer.write_u8(self.flags);
-        writer.write_u16_le(self.msg_id);
-        writer.write_u16_le(self.peer_constant);
-        writer.write_u32_le(self.client_tick);
-        writer.write_u32_le(0); // Padding
-        writer.write_u32_le(self.server_tick_echo);
-        writer.write_u32_le(0); // Padding
-    }
-}
-
-/// ServerToClientHeartbeat (type 7)
-/// Sent by server with game state updates
-#[derive(Debug, Clone)]
-pub struct ServerToClientHeartbeat {
-    pub server_tick: u32,
-    pub flags: u8,
-}
-
-impl ServerToClientHeartbeat {
-    pub fn parse(payload: &[u8]) -> Result<Self> {
-        if payload.len() < 10 {
-            // Minimal heartbeat with just tick
-            return Ok(Self {
-                server_tick: 0,
-                flags: 0,
-            });
-        }
-        // The server tick is embedded in the payload
-        // Format varies based on content, but typically includes tick number
-        let mut reader = BinaryReader::new(payload);
-        let flags = reader.read_u8()?;
-        let _data = reader.read_u16_le()?;
-        let server_tick = reader.read_u32_le()?;
-        Ok(Self { server_tick, flags })
+        writer.write_u32_le(self.heartbeat_sequence);
+        writer.write_u64_le(self.tick);
     }
 }
 
@@ -678,7 +646,7 @@ impl InputAction {
     }
 
     fn direction_vector(direction: Direction) -> (f64, f64) {
-        const SQRT1_2: f64 = 0.7071067811865475;
+        const SQRT1_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
         match direction {
             Direction::North => (0.0, -1.0),
             Direction::NorthEast => (SQRT1_2, -SQRT1_2),

@@ -344,6 +344,89 @@ pub enum InputActionType {
     UdpPacketReceived = 335,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelativeItemStackLocation {
+    pub kind: u8,
+    pub inventory_index: u8,
+    pub slot_index: u16,
+    pub source: u8,
+}
+
+impl RelativeItemStackLocation {
+    pub fn slot(inventory_index: u8, slot_index: u16, source: u8) -> Self {
+        Self {
+            kind: 0,
+            inventory_index,
+            slot_index,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalId {
+    pub kind: u8,
+    pub id: u16,
+}
+
+impl SignalId {
+    pub fn item(id: u16) -> Self {
+        Self { kind: 0, id }
+    }
+
+    pub fn fluid(id: u16) -> Self {
+        Self { kind: 1, id }
+    }
+
+    pub fn virtual_signal(id: u16) -> Self {
+        Self { kind: 2, id }
+    }
+
+    pub fn recipe(id: u16) -> Self {
+        Self { kind: 3, id }
+    }
+
+    pub fn entity(id: u16) -> Self {
+        Self { kind: 4, id }
+    }
+
+    pub fn space_location(id: u16) -> Self {
+        Self { kind: 5, id }
+    }
+
+    pub fn quality(id: u8) -> Self {
+        Self { kind: 6, id: id as u16 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogisticFilter {
+    pub signal: SignalId,
+    pub quality_id: u8,
+    pub quality_extra: u8,
+    pub min: u32,
+    pub max: u32,
+    pub mode: u32,
+    pub space_location_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientItemStackLocation {
+    pub item_id: u16,
+    pub quality_id: u8,
+    pub stack_id: u64,
+    pub location: RelativeItemStackLocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemStackTransferSpecification {
+    pub item_id: u16,
+    pub quality_id: u8,
+    pub stack_id: u64,
+    pub location: RelativeItemStackLocation,
+    pub mode: u8,
+}
+
 impl InputActionType {
     pub fn from_u16(v: u16) -> Option<Self> {
         if v <= 335 {
@@ -393,6 +476,9 @@ pub enum InputAction {
         direction: Direction,
         rail_data: Vec<u8>,
     },
+    WireDragging {
+        position: MapPosition,
+    },
     Deconstruct {
         area_left_top: MapPosition,
         area_right_bottom: MapPosition,
@@ -413,26 +499,28 @@ pub enum InputAction {
         area_left_top: MapPosition,
         area_right_bottom: MapPosition,
     },
+    RemoveCables {
+        position: MapPosition,
+    },
 
     // Inventory/Cursor
     CursorTransfer {
-        from_player: bool,
-        inventory_index: u16,
-        slot_index: u16,
+        location: ClientItemStackLocation,
     },
     CursorSplit {
-        from_player: bool,
-        inventory_index: u16,
-        slot_index: u16,
+        location: ClientItemStackLocation,
     },
     StackTransfer {
-        from_player: bool,
-        inventory_index: u16,
-        slot_index: u16,
+        spec: ItemStackTransferSpecification,
     },
     InventoryTransfer {
-        inventory_index: u16,
-        slot_index: u16,
+        spec: ItemStackTransferSpecification,
+    },
+    StackSplit {
+        spec: ItemStackTransferSpecification,
+    },
+    InventorySplit {
+        spec: ItemStackTransferSpecification,
     },
     FastEntityTransfer {
         from_player: bool,
@@ -443,10 +531,15 @@ pub enum InputAction {
     DropItem {
         position: MapPosition,
     },
+    SetGhostCursor {
+        item_id: u16,
+        quality_id: Option<u8>,
+    },
     SetFilter {
-        inventory_index: u16,
-        slot_index: u16,
-        item_name: String,
+        location: RelativeItemStackLocation,
+        item_id: u16,
+        quality_id: u8,
+        quality_extra: Option<u8>,
     },
     SetInventoryBar {
         inventory_index: u16,
@@ -454,8 +547,16 @@ pub enum InputAction {
     },
 
     // Crafting
+    SetupAssemblingMachine {
+        recipe_id: u16,
+        quality_id: Option<u8>,
+    },
     Craft {
         recipe_id: u16,
+        count: u32,
+    },
+    CancelCraft {
+        index: u16,
         count: u32,
     },
 
@@ -559,29 +660,30 @@ pub enum InputAction {
     ImportBlueprint {
         blueprint_string: String,
     },
+    ImportBlueprintString {
+        blueprint_string: String,
+        flags: u16,
+        mode: u8,
+    },
     ExportBlueprint {
         inventory_index: u16,
         slot_index: u16,
     },
-    CopyEntitySettings {
-        source_entity: u32,
-        target_entity: u32,
-    },
-    PasteEntitySettings {
-        source_entity: u32,
-        target_entity: u32,
-    },
+    CopyEntitySettings,
+    PasteEntitySettings,
 
     // Logistics
     SetLogisticFilterItem {
+        filter: LogisticFilter,
+        section_type: u8,
+        section_index: u8,
         slot_index: u16,
-        item_name: String,
-        count: u32,
     },
     SetLogisticFilterSignal {
+        filter: LogisticFilter,
+        section_type: u8,
+        section_index: u8,
         slot_index: u16,
-        signal_type: u8,
-        signal_name: String,
     },
 
     // Circuit network
@@ -628,8 +730,11 @@ pub enum InputAction {
         area_left_top: MapPosition,
         area_right_bottom: MapPosition,
     },
+    ChangePickingState {
+        picking: bool,
+    },
     SelectedEntityChanged {
-        entity_id: Option<u32>,
+        position: MapPosition,
     },
     SelectedEntityCleared,
 
@@ -653,6 +758,8 @@ pub enum InputAction {
         g: u8,
         b: u8,
     },
+    FinishedButContinuing,
+    ContinueSinglePlayer,
     ToggleShowEntityInfo,
     TogglePersonalRoboport,
     TogglePersonalLogisticRequests,
@@ -691,9 +798,9 @@ pub enum InputAction {
         reason: u8,
     },
 
-    // Unknown/raw action
+    // Unknown/raw action (action_type can be > 255 in S2C)
     Raw {
-        action_type: u8,
+        action_type: u16,
         data: Vec<u8>,
     },
 }
@@ -716,21 +823,28 @@ impl InputAction {
             Self::BuildGhost { .. } => InputActionType::Build, // BuildGhost merged into Build in 2.0
             Self::BuildTerrain { .. } => InputActionType::BuildTerrain,
             Self::BuildRail { .. } => InputActionType::BuildRail,
+            Self::WireDragging { .. } => InputActionType::WireDragging,
             Self::Deconstruct { .. } => InputActionType::Deconstruct,
             Self::CancelDeconstruct { .. } => InputActionType::CancelDeconstruct,
             Self::RotateEntity { .. } => InputActionType::RotateEntity,
             Self::Upgrade { .. } => InputActionType::Upgrade,
             Self::CancelUpgrade { .. } => InputActionType::CancelUpgrade,
+            Self::RemoveCables { .. } => InputActionType::RemoveCables,
             Self::CursorTransfer { .. } => InputActionType::CursorTransfer,
             Self::CursorSplit { .. } => InputActionType::CursorSplit,
             Self::StackTransfer { .. } => InputActionType::StackTransfer,
             Self::InventoryTransfer { .. } => InputActionType::InventoryTransfer,
+            Self::StackSplit { .. } => InputActionType::StackSplit,
+            Self::InventorySplit { .. } => InputActionType::InventorySplit,
             Self::FastEntityTransfer { .. } => InputActionType::FastEntityTransfer,
             Self::FastEntitySplit { .. } => InputActionType::FastEntitySplit,
             Self::DropItem { .. } => InputActionType::DropItem,
+            Self::SetGhostCursor { .. } => InputActionType::SetGhostCursor,
             Self::SetFilter { .. } => InputActionType::SetFilter,
             Self::SetInventoryBar { .. } => InputActionType::SetInventoryBar,
+            Self::SetupAssemblingMachine { .. } => InputActionType::SetupAssemblingMachine,
             Self::Craft { .. } => InputActionType::Craft,
+            Self::CancelCraft { .. } => InputActionType::CancelCraft,
             Self::ChangeShootingState { .. } => InputActionType::ChangeShootingState,
             Self::ChangeRidingState { .. } => InputActionType::ChangeRidingState,
             Self::UseItem { .. } => InputActionType::UseItem,
@@ -755,9 +869,10 @@ impl InputAction {
             Self::AddTrainStation { .. } => InputActionType::AddTrainStation,
             Self::SetupBlueprint { .. } => InputActionType::SetupBlueprint,
             Self::ImportBlueprint { .. } => InputActionType::ImportBlueprint,
+            Self::ImportBlueprintString { .. } => InputActionType::ImportBlueprintString,
             Self::ExportBlueprint { .. } => InputActionType::ExportBlueprint,
-            Self::CopyEntitySettings { .. } => InputActionType::CopyEntitySettings,
-            Self::PasteEntitySettings { .. } => InputActionType::PasteEntitySettings,
+            Self::CopyEntitySettings => InputActionType::CopyEntitySettings,
+            Self::PasteEntitySettings => InputActionType::PasteEntitySettings,
             Self::SetLogisticFilterItem { .. } => InputActionType::SetLogisticFilterItem,
             Self::SetLogisticFilterSignal { .. } => InputActionType::SetLogisticFilterItem, // SetLogisticFilterSignal merged
             Self::SetCircuitCondition { .. } => InputActionType::SetCircuitCondition,
@@ -769,12 +884,15 @@ impl InputAction {
             Self::TakeEquipment { .. } => InputActionType::TakeEquipment,
             Self::SelectArea { .. } => InputActionType::SelectArea,
             Self::AltSelectArea { .. } => InputActionType::AltSelectArea,
+            Self::ChangePickingState { .. } => InputActionType::ChangePickingState,
             Self::SelectedEntityChanged { .. } => InputActionType::SelectedEntityChanged,
             Self::SelectedEntityCleared => InputActionType::SelectedEntityCleared,
             Self::QuickBarSetSlot { .. } => InputActionType::QuickBarSetSlot,
             Self::QuickBarPickSlot { .. } => InputActionType::QuickBarPickSlot,
             Self::QuickBarSetSelectedPage { .. } => InputActionType::QuickBarSetSelectedPage,
             Self::SetPlayerColor { .. } => InputActionType::SetPlayerColor,
+            Self::FinishedButContinuing => InputActionType::FinishedButContinuing,
+            Self::ContinueSinglePlayer => InputActionType::ContinueSinglePlayer,
             Self::ToggleShowEntityInfo => InputActionType::ToggleShowEntityInfo,
             Self::TogglePersonalRoboport => InputActionType::TogglePersonalRoboport,
             Self::TogglePersonalLogisticRequests => InputActionType::TogglePersonalLogisticRequests,
@@ -789,7 +907,14 @@ impl InputAction {
             Self::AdminAction { .. } => InputActionType::AdminAction,
             Self::PlayerJoinGame { .. } => InputActionType::PlayerJoinGame,
             Self::PlayerLeaveGame { .. } => InputActionType::PlayerLeaveGame,
-            Self::Raw { action_type, .. } => InputActionType::from_u8(*action_type).unwrap_or(InputActionType::Nothing),
+            Self::Raw { action_type, .. } => {
+                // Try u8 first for known types, otherwise return Nothing
+                if *action_type <= 255 {
+                    InputActionType::from_u8(*action_type as u8).unwrap_or(InputActionType::Nothing)
+                } else {
+                    InputActionType::Nothing
+                }
+            }
         }
     }
 
@@ -817,6 +942,7 @@ impl InputAction {
             }
 
             Self::StartWalking { direction_x, direction_y } => {
+                // Factorio encodes walking vector as two f64 values.
                 writer.write_f64_le(*direction_x);
                 writer.write_f64_le(*direction_y);
             }
@@ -858,6 +984,11 @@ impl InputAction {
                 writer.write_bytes(rail_data);
             }
 
+            Self::WireDragging { position } |
+            Self::RemoveCables { position } => {
+                writer.write_map_position(*position);
+            }
+
             Self::Deconstruct { area_left_top, area_right_bottom } |
             Self::CancelDeconstruct { area_left_top, area_right_bottom } |
             Self::Upgrade { area_left_top, area_right_bottom } |
@@ -873,17 +1004,24 @@ impl InputAction {
                 writer.write_bool(*reverse);
             }
 
-            Self::CursorTransfer { from_player, inventory_index, slot_index } |
-            Self::CursorSplit { from_player, inventory_index, slot_index } |
-            Self::StackTransfer { from_player, inventory_index, slot_index } => {
-                writer.write_bool(*from_player);
-                writer.write_u16_le(*inventory_index);
-                writer.write_u16_le(*slot_index);
+            Self::ChangePickingState { picking } => {
+                writer.write_bool(*picking);
             }
 
-            Self::InventoryTransfer { inventory_index, slot_index } => {
-                writer.write_u16_le(*inventory_index);
-                writer.write_u16_le(*slot_index);
+            Self::SelectedEntityChanged { position } => {
+                writer.write_map_position(*position);
+            }
+
+            Self::CursorTransfer { location } |
+            Self::CursorSplit { location } => {
+                write_client_item_stack_location(writer, *location);
+            }
+
+            Self::StackTransfer { spec } |
+            Self::InventoryTransfer { spec } |
+            Self::StackSplit { spec } |
+            Self::InventorySplit { spec } => {
+                write_item_stack_transfer_spec(writer, *spec);
             }
 
             Self::FastEntityTransfer { from_player } |
@@ -894,11 +1032,20 @@ impl InputAction {
             Self::DropItem { position } => {
                 writer.write_map_position(*position);
             }
+            Self::SetGhostCursor { item_id, quality_id } => {
+                writer.write_u16_le(*item_id);
+                if *item_id != 0 {
+                    writer.write_u8(quality_id.unwrap_or(0));
+                }
+            }
 
-            Self::SetFilter { inventory_index, slot_index, item_name } => {
-                writer.write_u16_le(*inventory_index);
-                writer.write_u16_le(*slot_index);
-                writer.write_string(item_name);
+            Self::SetFilter { location, item_id, quality_id, quality_extra } => {
+                write_relative_item_stack_location(writer, *location);
+                writer.write_u16_le(*item_id);
+                writer.write_u8(*quality_id);
+                if *quality_id != 0 {
+                    writer.write_u8(quality_extra.unwrap_or(2));
+                }
             }
 
             Self::SetInventoryBar { inventory_index, bar } => {
@@ -906,8 +1053,19 @@ impl InputAction {
                 writer.write_u16_le(*bar);
             }
 
+            Self::SetupAssemblingMachine { recipe_id, quality_id } => {
+                writer.write_u16_le(*recipe_id);
+                if *recipe_id != 0 {
+                    writer.write_u8(quality_id.unwrap_or(0));
+                }
+            }
+
             Self::Craft { recipe_id, count } => {
                 writer.write_u16_le(*recipe_id);
+                writer.write_u32_le(*count);
+            }
+            Self::CancelCraft { index, count } => {
+                writer.write_u16_le(*index);
                 writer.write_u32_le(*count);
             }
 
@@ -1011,27 +1169,35 @@ impl InputAction {
                 writer.write_string(blueprint_string);
             }
 
+            Self::ImportBlueprintString { blueprint_string, flags, mode } => {
+                writer.write_string(blueprint_string);
+                writer.write_u16_le(*flags);
+                writer.write_u8(*mode);
+            }
+
             Self::ExportBlueprint { inventory_index, slot_index } => {
                 writer.write_u16_le(*inventory_index);
                 writer.write_u16_le(*slot_index);
             }
 
-            Self::CopyEntitySettings { source_entity, target_entity } |
-            Self::PasteEntitySettings { source_entity, target_entity } => {
-                writer.write_u32_le(*source_entity);
-                writer.write_u32_le(*target_entity);
-            }
+            Self::CopyEntitySettings |
+            Self::PasteEntitySettings => {}
 
-            Self::SetLogisticFilterItem { slot_index, item_name, count } => {
+            Self::SetLogisticFilterItem { filter, section_type, section_index, slot_index } |
+            Self::SetLogisticFilterSignal { filter, section_type, section_index, slot_index } => {
+                write_signal_id_base(writer, filter.signal);
+                writer.write_u8(filter.quality_id);
+                if filter.quality_id != 0 {
+                    let extra = if filter.quality_extra == 0 { 2 } else { filter.quality_extra };
+                    writer.write_u8(extra);
+                }
+                writer.write_u32_le(filter.min);
+                writer.write_u32_le(filter.max);
+                writer.write_u32_le(filter.mode);
+                writer.write_u16_le(filter.space_location_id);
+                writer.write_u8(*section_type);
+                writer.write_u8(*section_index);
                 writer.write_u16_le(*slot_index);
-                writer.write_string(item_name);
-                writer.write_u32_le(*count);
-            }
-
-            Self::SetLogisticFilterSignal { slot_index, signal_type, signal_name } => {
-                writer.write_u16_le(*slot_index);
-                writer.write_u8(*signal_type);
-                writer.write_string(signal_name);
             }
 
             Self::SetCircuitCondition { entity_id, condition_data } => {
@@ -1135,9 +1301,18 @@ impl InputAction {
     }
 
     fn read_inner(reader: &mut BinaryReader, strict: bool) -> Result<Self> {
-        let action_type = reader.read_u8()?;
+        // Action type is varint-encoded: u8 if < 255, else 0xFF + u16
+        let action_type = match reader.read_u8()? {
+            0xFF => reader.read_u16_le()?,
+            v => v as u16,
+        };
 
-        match InputActionType::from_u8(action_type) {
+        // For action types > 255, treat as unknown (will become Raw)
+        match if action_type <= 255 { 
+            InputActionType::from_u8(action_type as u8) 
+        } else { 
+            None 
+        } {
             Some(InputActionType::Nothing) => Ok(Self::Nothing),
             Some(InputActionType::StopWalking) => Ok(Self::StopWalking),
             Some(InputActionType::StopMining) => Ok(Self::StopMining),
@@ -1147,15 +1322,36 @@ impl InputAction {
             Some(InputActionType::ClearCursor) => Ok(Self::ClearCursor),
             Some(InputActionType::CancelResearch) => Ok(Self::CancelResearch),
             Some(InputActionType::SelectedEntityCleared) => Ok(Self::SelectedEntityCleared),
+            Some(InputActionType::FinishedButContinuing) => Ok(Self::FinishedButContinuing),
+            Some(InputActionType::ContinueSinglePlayer) => Ok(Self::ContinueSinglePlayer),
             Some(InputActionType::ToggleShowEntityInfo) => Ok(Self::ToggleShowEntityInfo),
+            Some(InputActionType::StopMovementInTheNextTick) => Ok(Self::StopWalking),
+            Some(InputActionType::Undo) => Ok(Self::Nothing),
+            Some(InputActionType::Redo) => Ok(Self::Nothing),
+            Some(InputActionType::ToggleMapEditor) => Ok(Self::Nothing),
+            Some(InputActionType::GameCreatedFromScenario) => Ok(Self::Nothing),
+            Some(InputActionType::ActivatePaste) => Ok(Self::Nothing),
+            Some(InputActionType::ToggleEquipmentMovementBonus) => Ok(Self::Nothing),
+            Some(InputActionType::ToggleEntityLogisticRequests) => Ok(Self::Nothing),
+            Some(InputActionType::ToggleArtilleryAutoTargeting) => Ok(Self::Nothing),
+            Some(InputActionType::StopDragBuild) => Ok(Self::Nothing),
+            Some(InputActionType::FlushOpenedEntityFluid) => Ok(Self::Nothing),
+            Some(InputActionType::AddLogisticSection) => Ok(Self::Nothing),
+            Some(InputActionType::AcknowledgeTechnology) => Ok(Self::Nothing),
+            Some(InputActionType::OpenOpenedEntityGrid) => Ok(Self::Nothing),
             Some(InputActionType::TogglePersonalRoboport) => Ok(Self::TogglePersonalRoboport),
             Some(InputActionType::TogglePersonalLogisticRequests) => Ok(Self::TogglePersonalLogisticRequests),
+            Some(InputActionType::CopyEntitySettings) => Ok(Self::CopyEntitySettings),
+            Some(InputActionType::PasteEntitySettings) => Ok(Self::PasteEntitySettings),
             Some(InputActionType::LaunchRocket) => Ok(Self::LaunchRocket),
             Some(InputActionType::OpenProductionGui) => Ok(Self::OpenProductionGui),
             Some(InputActionType::OpenLogisticsGui) => Ok(Self::OpenLogisticsGui),
             Some(InputActionType::OpenBlueprintLibraryGui) => Ok(Self::OpenBlueprintLibraryGui),
             Some(InputActionType::OpenTrainsGui) => Ok(Self::OpenTrainsGui),
             Some(InputActionType::OpenAchievementsGui) => Ok(Self::OpenAchievementsGui),
+            Some(InputActionType::CheckCRCHeuristic) => Ok(Self::Nothing),
+            Some(InputActionType::CheckCRC) => Ok(Self::Nothing),
+            Some(InputActionType::ForceFullCRC) => Ok(Self::Nothing),
 
             Some(InputActionType::StartWalking) => {
                 let direction_x = reader.read_f64_le()?;
@@ -1189,9 +1385,37 @@ impl InputAction {
                 })
             }
 
+            Some(InputActionType::WireDragging) => {
+                Ok(Self::WireDragging {
+                    position: reader.read_map_position()?,
+                })
+            }
+
+            Some(InputActionType::RemoveCables) => {
+                Ok(Self::RemoveCables {
+                    position: reader.read_map_position()?,
+                })
+            }
+
+            Some(InputActionType::SetupAssemblingMachine) => {
+                let recipe_id = reader.read_u16_le()?;
+                let quality_id = if recipe_id != 0 {
+                    Some(reader.read_u8()?)
+                } else {
+                    None
+                };
+                Ok(Self::SetupAssemblingMachine { recipe_id, quality_id })
+            }
+
             Some(InputActionType::Craft) => {
                 Ok(Self::Craft {
                     recipe_id: reader.read_u16_le()?,
+                    count: reader.read_u32_le()?,
+                })
+            }
+            Some(InputActionType::CancelCraft) => {
+                Ok(Self::CancelCraft {
+                    index: reader.read_u16_le()?,
                     count: reader.read_u32_le()?,
                 })
             }
@@ -1230,9 +1454,90 @@ impl InputAction {
             }
 
             Some(InputActionType::SelectedEntityChanged) => {
-                let entity_id_raw = reader.read_u32_le()?;
-                let entity_id = if entity_id_raw == 0 { None } else { Some(entity_id_raw) };
-                Ok(Self::SelectedEntityChanged { entity_id })
+                Ok(Self::SelectedEntityChanged {
+                    position: reader.read_map_position()?,
+                })
+            }
+            Some(InputActionType::ChangePickingState) => {
+                Ok(Self::ChangePickingState {
+                    picking: reader.read_bool()?,
+                })
+            }
+            Some(InputActionType::CursorTransfer) => {
+                let location = read_client_item_stack_location(reader)?;
+                Ok(Self::CursorTransfer { location })
+            }
+            Some(InputActionType::CursorSplit) => {
+                let location = read_client_item_stack_location(reader)?;
+                Ok(Self::CursorSplit { location })
+            }
+            Some(InputActionType::StackTransfer) => {
+                let spec = read_item_stack_transfer_spec(reader)?;
+                Ok(Self::StackTransfer { spec })
+            }
+            Some(InputActionType::InventoryTransfer) => {
+                let spec = read_item_stack_transfer_spec(reader)?;
+                Ok(Self::InventoryTransfer { spec })
+            }
+            Some(InputActionType::StackSplit) => {
+                let spec = read_item_stack_transfer_spec(reader)?;
+                Ok(Self::StackSplit { spec })
+            }
+            Some(InputActionType::InventorySplit) => {
+                let spec = read_item_stack_transfer_spec(reader)?;
+                Ok(Self::InventorySplit { spec })
+            }
+            Some(InputActionType::SetFilter) => {
+                let location = read_relative_item_stack_location(reader)?;
+                let item_id = reader.read_u16_le()?;
+                let quality_id = reader.read_u8()?;
+                let quality_extra = if quality_id != 0 {
+                    Some(reader.read_u8()?)
+                } else {
+                    None
+                };
+                Ok(Self::SetFilter {
+                    location,
+                    item_id,
+                    quality_id,
+                    quality_extra,
+                })
+            }
+            Some(InputActionType::SetLogisticFilterItem) => {
+                let filter = read_logistic_filter(reader)?;
+                let section_type = reader.read_u8()?;
+                let section_index = reader.read_u8()?;
+                let slot_index = reader.read_u16_le()?;
+                Ok(Self::SetLogisticFilterItem {
+                    filter,
+                    section_type,
+                    section_index,
+                    slot_index,
+                })
+            }
+            Some(InputActionType::ImportBlueprint) => {
+                Ok(Self::ImportBlueprint {
+                    blueprint_string: reader.read_string()?,
+                })
+            }
+            Some(InputActionType::ImportBlueprintString) => {
+                let blueprint_string = reader.read_string()?;
+                let flags = reader.read_u16_le()?;
+                let mode = reader.read_u8()?;
+                Ok(Self::ImportBlueprintString {
+                    blueprint_string,
+                    flags,
+                    mode,
+                })
+            }
+            Some(InputActionType::SetGhostCursor) => {
+                let item_id = reader.read_u16_le()?;
+                let quality_id = if item_id != 0 {
+                    Some(reader.read_u8()?)
+                } else {
+                    None
+                };
+                Ok(Self::SetGhostCursor { item_id, quality_id })
             }
 
             Some(InputActionType::DropItem) => {
@@ -1258,6 +1563,126 @@ impl InputAction {
             }
         }
     }
+}
+
+fn write_relative_item_stack_location(
+    writer: &mut BinaryWriter,
+    location: RelativeItemStackLocation,
+) {
+    writer.write_u8(location.kind);
+    if location.kind == 0 {
+        writer.write_u8(location.inventory_index);
+        writer.write_u16_le(location.slot_index);
+    }
+    writer.write_u8(location.source);
+}
+
+fn read_relative_item_stack_location(reader: &mut BinaryReader) -> Result<RelativeItemStackLocation> {
+    let kind = reader.read_u8()?;
+    let (inventory_index, slot_index) = if kind == 0 {
+        (reader.read_u8()?, reader.read_u16_le()?)
+    } else {
+        (0xff, 0xffff)
+    };
+    let source = reader.read_u8()?;
+    Ok(RelativeItemStackLocation {
+        kind,
+        inventory_index,
+        slot_index,
+        source,
+    })
+}
+
+fn write_signal_id_base(writer: &mut BinaryWriter, signal: SignalId) {
+    writer.write_u8(signal.kind);
+    if signal.kind == 6 {
+        writer.write_u8(signal.id as u8);
+    } else {
+        writer.write_u16_le(signal.id);
+    }
+}
+
+fn read_signal_id_base(reader: &mut BinaryReader) -> Result<SignalId> {
+    let kind = reader.read_u8()?;
+    let id = if kind == 6 {
+        reader.read_u8()? as u16
+    } else {
+        reader.read_u16_le()?
+    };
+    Ok(SignalId { kind, id })
+}
+
+fn read_logistic_filter(reader: &mut BinaryReader) -> Result<LogisticFilter> {
+    let signal = read_signal_id_base(reader)?;
+    let quality_id = reader.read_u8()?;
+    let quality_extra = if quality_id != 0 {
+        reader.read_u8()?
+    } else {
+        2
+    };
+    let min = reader.read_u32_le()?;
+    let max = reader.read_u32_le()?;
+    let mode = reader.read_u32_le()?;
+    let space_location_id = reader.read_u16_le()?;
+    Ok(LogisticFilter {
+        signal,
+        quality_id,
+        quality_extra,
+        min,
+        max,
+        mode,
+        space_location_id,
+    })
+}
+
+fn write_client_item_stack_location(writer: &mut BinaryWriter, location: ClientItemStackLocation) {
+    writer.write_u16_le(location.item_id);
+    if location.item_id != 0 {
+        writer.write_u8(location.quality_id);
+    }
+    writer.write_u64_le(location.stack_id);
+    write_relative_item_stack_location(writer, location.location);
+}
+
+fn read_client_item_stack_location(reader: &mut BinaryReader) -> Result<ClientItemStackLocation> {
+    let item_id = reader.read_u16_le()?;
+    let quality_id = if item_id != 0 { reader.read_u8()? } else { 0 };
+    let stack_id = reader.read_u64_le()?;
+    let location = read_relative_item_stack_location(reader)?;
+    Ok(ClientItemStackLocation {
+        item_id,
+        quality_id,
+        stack_id,
+        location,
+    })
+}
+
+fn write_item_stack_transfer_spec(
+    writer: &mut BinaryWriter,
+    spec: ItemStackTransferSpecification,
+) {
+    writer.write_u16_le(spec.item_id);
+    if spec.item_id != 0 {
+        writer.write_u8(spec.quality_id);
+    }
+    writer.write_u64_le(spec.stack_id);
+    write_relative_item_stack_location(writer, spec.location);
+    writer.write_u8(spec.mode);
+}
+
+fn read_item_stack_transfer_spec(reader: &mut BinaryReader) -> Result<ItemStackTransferSpecification> {
+    let item_id = reader.read_u16_le()?;
+    let quality_id = if item_id != 0 { reader.read_u8()? } else { 0 };
+    let stack_id = reader.read_u64_le()?;
+    let location = read_relative_item_stack_location(reader)?;
+    let mode = reader.read_u8()?;
+    Ok(ItemStackTransferSpecification {
+        item_id,
+        quality_id,
+        stack_id,
+        location,
+        mode,
+    })
 }
 
 /// Shooting state

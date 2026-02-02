@@ -93,6 +93,21 @@ impl Direction {
         }
     }
 
+    pub fn to_vector(self) -> (f64, f64) {
+        // Use the f32 constant to ensure length^2 <= 1.0 for diagonals.
+        const S: f64 = std::f32::consts::FRAC_1_SQRT_2 as f64;
+        match self {
+            Self::North => (0.0, -1.0),
+            Self::NorthEast => (S, -S),
+            Self::East => (1.0, 0.0),
+            Self::SouthEast => (S, S),
+            Self::South => (0.0, 1.0),
+            Self::SouthWest => (-S, S),
+            Self::West => (-1.0, 0.0),
+            Self::NorthWest => (-S, -S),
+        }
+    }
+
     pub fn opposite(self) -> Self {
         match self {
             Self::North => Self::South,

@@ -113,13 +113,17 @@ impl PacketHeader {
         // Fragment ID exists for ANY message type when bit6 is set
         let fragmented = fragmented_flag;
 
-        // Determine if msg_id is present based on doc:
+        // Determine if msg_id is present based on doc/PCAP:
         // - Types 2, 4 (ConnectionRequest, ConnectionRequestReplyConfirm): ALWAYS have msg_id
         // - Types 0, 1, 3 (Ping, PingReply, ConnectionRequestReply): msg_id only if bit6 set
-        // - Types 5-18: msg_id only if bit6 set
+        // - Heartbeats (6, 7): msg_id only when fragmented (reliable bit does NOT add msg_id)
+        // - Other types: msg_id if bit6 set OR if reliable bit (0x20) is set
+        // PCAP shows heartbeat flags immediately after type byte, even for reliable (0x26).
         let has_msg_id = match message_type {
             MessageType::ConnectionRequest | MessageType::ConnectionRequestReplyConfirm => true,
-            _ => fragmented_flag, // bit6 must be set for msg_id
+            MessageType::Ping | MessageType::PingReply | MessageType::ConnectionRequestReply => fragmented_flag,
+            MessageType::ClientToServerHeartbeat | MessageType::ServerToClientHeartbeat => fragmented_flag,
+            _ => fragmented_flag || reliable, // msg_id if fragmented OR reliable
         };
 
         if !has_msg_id {

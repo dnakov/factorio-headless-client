@@ -35,7 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tui_main {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::io::{stdout, Write};
+    use std::io::stdout;
+    use std::fs::OpenOptions;
+    use std::io::Write as IoWrite;
+    #[cfg(feature = "gpu")]
+    use std::io::Write;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -52,7 +56,7 @@ mod tui_main {
         widgets::{Block, Borders, Paragraph},
     };
 
-    use factorio_client::codec::{MapEntity, MapTile, parse_map_data, check_player_collision};
+    use factorio_client::codec::{MapEntity, MapTile, parse_map_data_with_progress, parse_map_resources, check_player_collision, ParseProgress};
     use factorio_client::noise::terrain::TerrainGenerator;
     use factorio_client::protocol::{Connection, PlayerState};
 
@@ -291,7 +295,7 @@ mod tui_main {
                 for ent in &app.entities {
                     if ent.x < min_x - 2.0 || ent.x > max_x + 2.0
                         || ent.y < min_y - 2.0 || ent.y > max_y + 2.0 { continue; }
-                    let uv = match self.atlas.get_uv(&ent.name) {
+                    let uv = match self.atlas.get_uv_or_fallback(&ent.name) {
                         Some(uv) => uv,
                         None => continue,
                     };
@@ -381,9 +385,17 @@ mod tui_main {
         entities: Vec<MapEntity>,
         tiles: Vec<MapTile>,
         tile_index: HashMap<(i32, i32), usize>,
+        entity_chunk_index: HashMap<(i32, i32), Vec<usize>>,
+        map_parse_handle: Option<std::thread::JoinHandle<()>>,
+        map_parse_rx: Option<std::sync::mpsc::Receiver<Result<ParsedMapBundle, String>>>,
+        resource_parse_rx: Option<std::sync::mpsc::Receiver<Vec<MapEntity>>>,
+        map_parse_progress: Option<std::sync::Arc<ParseProgress>>,
+        map_parse_started_at: Option<Instant>,
+        resource_parse_started_at: Option<Instant>,
         map_size: usize,
         map_seed: u32,
         map_bounds: Option<f64>, // Half-size: map extends from -bounds to +bounds
+        map_controls: HashMap<String, f32>,
         terrain_generator: RefCell<Option<TerrainGenerator>>,
         terrain_cache: RefCell<HashMap<(i32, i32), [u8; 1024]>>,
 
@@ -392,6 +404,7 @@ mod tui_main {
 
         // UI
         log: Vec<(String, Color)>,
+        log_file: Option<std::fs::File>,
         status: String,
         chat_input: String,
         chat_mode: bool,
@@ -435,9 +448,17 @@ mod tui_main {
                 entities: Vec::new(),
                 tiles: Vec::new(),
                 tile_index: HashMap::new(),
+                entity_chunk_index: HashMap::new(),
+                map_parse_handle: None,
+                map_parse_rx: None,
+                resource_parse_rx: None,
+                map_parse_progress: None,
+                map_parse_started_at: None,
+                resource_parse_started_at: None,
                 map_size: 0,
                 map_seed: 0,
                 map_bounds: None,
+                map_controls: HashMap::new(),
                 terrain_generator: RefCell::new(None),
                 terrain_cache: RefCell::new(HashMap::new()),
                 other_players: Vec::new(),
@@ -446,11 +467,12 @@ mod tui_main {
                     (format!("Player: {}", username), Color::White),
                     ("Press Enter to connect".into(), Color::Yellow),
                 ],
+                log_file: None,
                 status: "Ready".into(),
                 chat_input: String::new(),
                 chat_mode: false,
                 show_help: false,
-                show_parsed_map: true,
+                show_parsed_map: false,
                 #[cfg(feature = "gpu")]
                 gpu_renderer: RefCell::new(None),
             }
@@ -461,10 +483,89 @@ mod tui_main {
         }
 
         fn log(&mut self, msg: impl Into<String>, color: Color) {
-            self.log.push((msg.into(), color));
+            let msg = msg.into();
+            if let Some(file) = self.log_file.as_mut() {
+                let _ = writeln!(file, "{}", msg);
+                let _ = file.flush();
+            }
+            self.log.push((msg, color));
             if self.log.len() > 100 {
                 self.log.remove(0);
             }
+        }
+
+        fn clear_parse_progress_if_done(&mut self) {
+            if self.map_parse_rx.is_none() && self.resource_parse_rx.is_none() {
+                self.map_parse_progress = None;
+                self.map_parse_started_at = None;
+                self.resource_parse_started_at = None;
+            }
+        }
+
+        fn map_parse_status_line(&self) -> Option<String> {
+            let parsing_map = self.map_parse_rx.is_some();
+            let parsing_resources = self.resource_parse_rx.is_some();
+            if !parsing_map && !parsing_resources {
+                return None;
+            }
+
+            let spinner = ['|', '/', '-', '\\'];
+            let start = if parsing_map {
+                self.map_parse_started_at
+            } else {
+                self.resource_parse_started_at
+            };
+            let spin_idx = start
+                .map(|t| ((t.elapsed().as_millis() / 200) as usize) % spinner.len())
+                .unwrap_or(0);
+
+            let mut line = if parsing_map {
+                if let Some(progress) = self.map_parse_progress.as_ref() {
+                    let entities_total = progress.entities_total();
+                    let resources_total = progress.resources_total();
+                    let tiles_total = progress.tiles_total();
+                    let total_total = entities_total + resources_total + tiles_total;
+                    let entities_done = progress.entities_done();
+                    let resources_done = progress.resources_done();
+                    let tiles_done = progress.tiles_done();
+                    let total_done = entities_done + resources_done + tiles_done;
+                    let pct = if total_total > 0 {
+                        (total_done as f64 / total_total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let bar_width = 20usize;
+                    let filled = if total_total > 0 {
+                        ((total_done as f64 / total_total as f64) * bar_width as f64).round() as usize
+                    } else {
+                        0
+                    };
+                    let mut bar = String::with_capacity(bar_width);
+                    for i in 0..bar_width {
+                        bar.push(if i < filled { '#' } else { '-' });
+                    }
+                    format!(
+                        "Parsing map {:.1}% [{}] stage={} ({}/{})",
+                        pct,
+                        bar,
+                        progress.stage().as_str(),
+                        total_done,
+                        total_total
+                    )
+                } else {
+                    "Parsing map...".to_string()
+                }
+            } else {
+                "Parsing resources...".to_string()
+            };
+
+            if let Some(start) = start {
+                let elapsed = start.elapsed().as_secs();
+                line.push_str(&format!(" elapsed={}s", elapsed));
+            }
+            line.push(' ');
+            line.push(spinner[spin_idx]);
+            Some(line)
         }
 
         fn cursor_world_pos(&self) -> (f64, f64) {
@@ -475,12 +576,27 @@ mod tui_main {
 
         fn entity_at_cursor(&self) -> Option<&MapEntity> {
             let (cx, cy) = self.cursor_world_pos();
-            self.entities.iter().find(|e| {
-                let half_w = e.tile_width() / 2.0;
-                let half_h = e.tile_height() / 2.0;
-                cx >= e.x - half_w && cx < e.x + half_w
-                    && cy >= e.y - half_h && cy < e.y + half_h
-            })
+            let tile_x = cx.floor() as i32;
+            let tile_y = cy.floor() as i32;
+            let chunk_x = tile_x.div_euclid(32);
+            let chunk_y = tile_y.div_euclid(32);
+            self.entity_chunk_index
+                .get(&(chunk_x, chunk_y))
+                .and_then(|indices| {
+                    indices.iter().find_map(|idx| {
+                        self.entities.get(*idx).and_then(|e| {
+                            let half_w = e.tile_width() / 2.0;
+                            let half_h = e.tile_height() / 2.0;
+                            if cx >= e.x - half_w && cx < e.x + half_w
+                                && cy >= e.y - half_h && cy < e.y + half_h
+                            {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                })
         }
 
         fn nearby_entity_count(&self) -> usize {
@@ -501,7 +617,7 @@ mod tui_main {
             {
                 let mut gen = self.terrain_generator.borrow_mut();
                 if gen.is_none() {
-                    *gen = TerrainGenerator::new(self.map_seed).ok();
+                    *gen = TerrainGenerator::new_with_controls(self.map_seed, &self.map_controls).ok();
                 }
             }
 
@@ -602,7 +718,14 @@ mod tui_main {
         let rt = tokio::runtime::Runtime::new()?;
 
         // Query terminal for graphics protocol support + font size (before raw mode)
-        let picker = Picker::from_query_stdio().ok();
+        let disable_images = std::env::var("TUI_NO_IMAGES").is_ok()
+            || std::env::var("TMUX").is_ok()
+            || std::env::var("TERM").ok().map(|t| t.starts_with("tmux")).unwrap_or(false);
+        let picker = if disable_images {
+            None
+        } else {
+            Picker::from_query_stdio().ok()
+        };
         let entity_icons: RefCell<Option<EntityIcons>> = RefCell::new(picker.map(|p| {
             let mut icons = EntityIcons::new(p);
             let factorio_path = Path::new(FACTORIO_DATA_PATH);
@@ -620,40 +743,87 @@ mod tui_main {
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
         let mut app = App::new(server_addr, username);
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("tui.log")
+        {
+            app.log_file = Some(file);
+            app.log("Log file: tui.log", Color::Gray);
+        }
+        if disable_images {
+            app.log("Image rendering disabled (tmux/TUI_NO_IMAGES)", Color::Gray);
+        }
+        if std::env::var("FACTORIO_AUTO_CONNECT").is_ok() {
+            app.log("Auto-connect enabled", Color::Yellow);
+            app.state = AppState::Connecting;
+        }
         #[cfg(feature = "gpu")]
         { *app.gpu_renderer.borrow_mut() = gpu_init; }
 
         // Load offline map if specified
         if let Some(ref path) = offline_map {
-            match load_offline_map(path) {
-                Ok((entities, tiles, map_size, seed)) => {
-                    app.entities = entities;
-                    app.tiles = tiles;
-                    app.tile_index = build_tile_index(&app.tiles);
-                    app.map_size = map_size;
-                    app.map_seed = seed_override.unwrap_or(seed);
-
-                    if size_arg.is_none() {
-                        let max_extent = app.tiles.iter()
-                            .map(|t| t.x.abs().max(t.y.abs()))
-                            .max()
-                            .unwrap_or(100) as f64;
-                        app.map_bounds = Some(max_extent + 10.0);
-                    }
-
+            match std::fs::read(path) {
+                Ok(data) => {
+                    app.map_size = data.len();
                     app.state = AppState::OfflineMap;
+                    app.show_parsed_map = false;
                     app.log.clear();
-                    app.log(format!("Loaded map: {} entities, {} tiles", app.entities.len(), app.tiles.len()), Color::Green);
-                    if seed_override.is_some() {
-                        app.log(format!("Seed override: {}", app.map_seed), Color::Yellow);
-                    } else {
-                        app.log(format!("Map seed: {}", app.map_seed), Color::Gray);
-                    }
-                    if let Some(bounds) = app.map_bounds {
-                        app.log(format!("Map bounds: ±{:.0} tiles", bounds), Color::Gray);
-                    }
-                    app.log("Use WASD to pan, +/- to zoom, P to toggle parsed map", Color::Yellow);
+                    app.log("Parsing offline map...", Color::Yellow);
                     app.status = "Offline Map Viewer".into();
+
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (rtx, rrx) = std::sync::mpsc::channel();
+                    app.map_parse_rx = Some(rx);
+                    app.resource_parse_rx = Some(rrx);
+                    let progress = std::sync::Arc::new(ParseProgress::new());
+                    app.map_parse_progress = Some(progress.clone());
+                    app.map_parse_started_at = Some(Instant::now());
+                    app.resource_parse_started_at = Some(Instant::now());
+
+                    let map_bytes = std::sync::Arc::new(data);
+                    let map_bytes_for_parse = std::sync::Arc::clone(&map_bytes);
+                    let map_bytes_for_resources = std::sync::Arc::clone(&map_bytes);
+                    app.map_parse_handle = Some(std::thread::spawn(move || {
+                        let prev_skip_resources = std::env::var("FACTORIO_SKIP_RESOURCE_PARSE").ok();
+                        std::env::set_var("FACTORIO_SKIP_RESOURCE_PARSE", "1");
+                        std::env::set_var("FACTORIO_SKIP_PROCEDURAL_TILES", "1");
+                        let result = parse_map_data_with_progress(&map_bytes_for_parse, Some(progress))
+                            .map(|map| {
+                                let tile_index = build_tile_index(&map.tiles);
+                                let entity_chunk_index = build_entity_chunk_index(&map.entities);
+                                ParsedMapBundle {
+                                    entities: map.entities,
+                                    tiles: map.tiles,
+                                    tile_index,
+                                    entity_chunk_index,
+                                    seed: map.seed,
+                                    spawn: map.player_spawn,
+                                    map_width: map.map_width,
+                                    map_height: map.map_height,
+                                    map_controls: map.map_controls,
+                                }
+                            })
+                            .map_err(|e| e.to_string());
+                        std::env::remove_var("FACTORIO_SKIP_PROCEDURAL_TILES");
+                        if let Some(prev) = prev_skip_resources {
+                            std::env::set_var("FACTORIO_SKIP_RESOURCE_PARSE", prev);
+                        } else {
+                            std::env::remove_var("FACTORIO_SKIP_RESOURCE_PARSE");
+                        }
+                        let _ = tx.send(result);
+
+                        std::thread::spawn(move || {
+                            match parse_map_resources(&map_bytes_for_resources) {
+                                Ok(resources) => {
+                                    let _ = rtx.send(resources);
+                                }
+                                Err(e) => {
+                                    eprintln!("[ERROR] Resource parse failed: {}", e);
+                                }
+                            }
+                        });
+                    }));
                 }
                 Err(e) => {
                     app.log(format!("Failed to load map: {}", e), Color::Red);
@@ -739,8 +909,32 @@ mod tui_main {
     fn load_offline_map(path: &PathBuf) -> Result<(Vec<MapEntity>, Vec<MapTile>, usize, u32), Box<dyn std::error::Error>> {
         let data = std::fs::read(path)?;
         let map_size = data.len();
-        let map_data = parse_map_data(&data)?;
+        let map_data = parse_map_data_with_progress(&data, None)?;
         Ok((map_data.entities, map_data.tiles, map_size, map_data.seed))
+    }
+
+    fn build_entity_chunk_index(entities: &[MapEntity]) -> HashMap<(i32, i32), Vec<usize>> {
+        let mut index: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (idx, entity) in entities.iter().enumerate() {
+            let half_w = entity.tile_width() / 2.0;
+            let half_h = entity.tile_height() / 2.0;
+            let min_x = (entity.x - half_w).floor() as i32;
+            let max_x = (entity.x + half_w).ceil() as i32;
+            let min_y = (entity.y - half_h).floor() as i32;
+            let max_y = (entity.y + half_h).ceil() as i32;
+
+            let min_chunk_x = min_x.div_euclid(32);
+            let max_chunk_x = max_x.div_euclid(32);
+            let min_chunk_y = min_y.div_euclid(32);
+            let max_chunk_y = max_y.div_euclid(32);
+
+            for cy in min_chunk_y..=max_chunk_y {
+                for cx in min_chunk_x..=max_chunk_x {
+                    index.entry((cx, cy)).or_default().push(idx);
+                }
+            }
+        }
+        index
     }
 
     fn build_tile_index(tiles: &[MapTile]) -> HashMap<(i32, i32), usize> {
@@ -749,6 +943,18 @@ mod tui_main {
             index.insert((tile.x, tile.y), idx);
         }
         index
+    }
+
+    struct ParsedMapBundle {
+        entities: Vec<MapEntity>,
+        tiles: Vec<MapTile>,
+        tile_index: HashMap<(i32, i32), usize>,
+        entity_chunk_index: HashMap<(i32, i32), Vec<usize>>,
+        seed: u32,
+        spawn: (f64, f64),
+        map_width: u32,
+        map_height: u32,
+        map_controls: HashMap<String, f32>,
     }
 
     fn update(app: &mut App, rt: &tokio::runtime::Runtime) {
@@ -761,6 +967,20 @@ mod tui_main {
                             Ok(()) => {
                                 app.player_index = conn.player_index();
                                 app.server_name = conn.server_name().map(|s| s.to_string());
+                                app.entities.clear();
+                                app.tiles.clear();
+                                app.tile_index.clear();
+                                app.entity_chunk_index.clear();
+                                app.map_seed = 0;
+                                app.map_bounds = None;
+                                app.map_controls.clear();
+                                app.show_parsed_map = false;
+                                app.resource_parse_rx = None;
+                                app.map_parse_progress = None;
+                                app.map_parse_started_at = None;
+                                app.resource_parse_started_at = None;
+                                *app.terrain_generator.borrow_mut() = None;
+                                app.terrain_cache.borrow_mut().clear();
                                 app.log(format!("Connected as player #{}", app.player_index.unwrap_or(0)), Color::Green);
                                 if let Some(ref name) = app.server_name {
                                     app.log(format!("Server: {}", name), Color::Cyan);
@@ -782,21 +1002,81 @@ mod tui_main {
             }
 
             AppState::DownloadingMap => {
-                if let Some(ref mut conn) = app.connection {
-                    match rt.block_on(conn.download_map()) {
+                app.log("Downloading map...", Color::Yellow);
+                if let Some(mut conn) = app.connection.take() {
+                    std::env::set_var("FACTORIO_SKIP_MAP_PARSE", "1");
+                    let download_result = rt.block_on(conn.download_map());
+                    std::env::remove_var("FACTORIO_SKIP_MAP_PARSE");
+                    match download_result {
                         Ok(size) => {
-                            app.map_size = size;
-                            app.entities = conn.entities().to_vec();
-                            if let Ok(map) = parse_map_data(conn.map_data()) {
-                                app.tiles = map.tiles;
-                                app.tile_index = build_tile_index(&app.tiles);
-                                app.map_seed = map.seed;
-                            }
+                            let map_bytes = conn.map_data().to_vec();
                             let (x, y) = conn.player_position();
+                            app.map_size = size;
                             app.player_x = x;
                             app.player_y = y;
-                            app.log(format!("Map: {} KB, {} entities, {} tiles",
-                                size / 1024, app.entities.len(), app.tiles.len()), Color::Green);
+                            app.log("Parsing map in background...", Color::Yellow);
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (rtx, rrx) = std::sync::mpsc::channel();
+                            app.map_parse_rx = Some(rx);
+                            app.resource_parse_rx = Some(rrx);
+                            let progress = std::sync::Arc::new(ParseProgress::new());
+                            app.map_parse_progress = Some(progress.clone());
+                            app.map_parse_started_at = Some(Instant::now());
+                            app.resource_parse_started_at = Some(Instant::now());
+                            let map_bytes = std::sync::Arc::new(map_bytes);
+                            let map_bytes_for_parse = std::sync::Arc::clone(&map_bytes);
+                            let map_bytes_for_resources = std::sync::Arc::clone(&map_bytes);
+                            app.map_parse_handle = Some(std::thread::spawn(move || {
+                                let prev_skip_resources = std::env::var("FACTORIO_SKIP_RESOURCE_PARSE").ok();
+                                std::env::set_var("FACTORIO_SKIP_RESOURCE_PARSE", "1");
+                                std::env::set_var("FACTORIO_SKIP_PROCEDURAL_TILES", "1");
+                                let result = parse_map_data_with_progress(&map_bytes_for_parse, Some(progress))
+                                    .map(|map| {
+                                        eprintln!(
+                                            "[DEBUG] TUI map parse: {} entities, {} tiles (building indexes)",
+                                            map.entities.len(),
+                                            map.tiles.len()
+                                        );
+                                        let tile_index = build_tile_index(&map.tiles);
+                                        let entity_chunk_index = build_entity_chunk_index(&map.entities);
+                                        eprintln!("[DEBUG] TUI map parse: index build complete");
+                                        ParsedMapBundle {
+                                            entities: map.entities,
+                                            tiles: map.tiles,
+                                            tile_index,
+                                            entity_chunk_index,
+                                            seed: map.seed,
+                                            spawn: map.player_spawn,
+                                            map_width: map.map_width,
+                                            map_height: map.map_height,
+                                            map_controls: map.map_controls,
+                                        }
+                                    })
+                                    .map_err(|e| e.to_string());
+                                std::env::remove_var("FACTORIO_SKIP_PROCEDURAL_TILES");
+                                if let Some(prev) = prev_skip_resources {
+                                    std::env::set_var("FACTORIO_SKIP_RESOURCE_PARSE", prev);
+                                } else {
+                                    std::env::remove_var("FACTORIO_SKIP_RESOURCE_PARSE");
+                                }
+                                let _ = tx.send(result);
+
+                                std::thread::spawn(move || {
+                                    match parse_map_resources(&map_bytes_for_resources) {
+                                        Ok(resources) => {
+                                            let _ = rtx.send(resources);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[ERROR] Resource parse failed: {}", e);
+                                        }
+                                    }
+                                });
+                            }));
+                            app.log(
+                                format!("Map: {} KB, {} entities, {} tiles",
+                                    size / 1024, app.entities.len(), app.tiles.len()),
+                                Color::Green,
+                            );
                             app.state = AppState::Connected;
                             app.status = "Connected".into();
                         }
@@ -805,14 +1085,87 @@ mod tui_main {
                             app.state = AppState::Error;
                         }
                     }
+                    app.connection = Some(conn);
                 }
             }
 
             AppState::Connected => {
+                if let Some(rx) = app.map_parse_rx.as_ref() {
+                    match rx.try_recv() {
+                        Ok(Ok(parsed)) => {
+                            app.entities = parsed.entities;
+                            app.tiles = parsed.tiles;
+                            app.tile_index = parsed.tile_index;
+                            app.entity_chunk_index = parsed.entity_chunk_index;
+                            app.map_seed = parsed.seed;
+                            app.map_controls = parsed.map_controls;
+                            *app.terrain_generator.borrow_mut() = None;
+                            app.terrain_cache.borrow_mut().clear();
+                            if parsed.map_width > 0 && parsed.map_height > 0 {
+                                let half_w = (parsed.map_width / 2) as f64;
+                                let half_h = (parsed.map_height / 2) as f64;
+                                app.map_bounds = Some(half_w.max(half_h));
+                            }
+                            if app.player_x == 0.0 && app.player_y == 0.0 {
+                                app.player_x = parsed.spawn.0;
+                                app.player_y = parsed.spawn.1;
+                            }
+                            app.log(
+                                format!(
+                                    "Parsed map: {} entities, {} tiles (seed={}, w={}, h={})",
+                                    app.entities.len(),
+                                    app.tiles.len(),
+                                    app.map_seed,
+                                    parsed.map_width,
+                                    parsed.map_height
+                                ),
+                                Color::Green,
+                            );
+                            app.show_parsed_map = true;
+                            app.status = "Map parsed".into();
+                            app.map_parse_rx = None;
+                            app.map_parse_handle = None;
+                        }
+                        Ok(Err(err)) => {
+                            app.log(format!("Map parse failed: {}", err), Color::Red);
+                            app.map_parse_rx = None;
+                            app.map_parse_handle = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            app.log("Map parse thread disconnected".to_string(), Color::Red);
+                            app.map_parse_rx = None;
+                            app.map_parse_handle = None;
+                        }
+                    }
+                }
+                if let Some(rx) = app.resource_parse_rx.as_ref() {
+                    match rx.try_recv() {
+                        Ok(resources) => {
+                            let before = app.entities.len();
+                            app.entities.extend(resources);
+                            app.entity_chunk_index = build_entity_chunk_index(&app.entities);
+                            let added = app.entities.len().saturating_sub(before);
+                            app.log(format!("Resources parsed: {} new entities", added), Color::Green);
+                            app.resource_parse_rx = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            app.resource_parse_rx = None;
+                        }
+                    }
+                }
+                app.clear_parse_progress_if_done();
+                let mut poll_error: Option<String> = None;
                 if let Some(ref mut conn) = app.connection {
                     for _ in 0..5 {
-                        if let Ok(Some(_)) = rt.block_on(conn.poll()) {
-                            app.packets_received += 1;
+                        match rt.block_on(conn.poll()) {
+                            Ok(Some(_)) => app.packets_received += 1,
+                            Ok(None) => {}
+                            Err(e) => {
+                                poll_error = Some(e.to_string());
+                                break;
+                            }
                         }
                     }
                     conn.update_position();
@@ -828,6 +1181,79 @@ mod tui_main {
                         .cloned()
                         .collect();
                 }
+                if let Some(err) = poll_error {
+                    app.log(format!("Connection error: {}", err), Color::Red);
+                    app.state = AppState::Error;
+                }
+            }
+
+            AppState::OfflineMap => {
+                if let Some(rx) = app.map_parse_rx.as_ref() {
+                    match rx.try_recv() {
+                        Ok(Ok(parsed)) => {
+                            app.entities = parsed.entities;
+                            app.tiles = parsed.tiles;
+                            app.tile_index = parsed.tile_index;
+                            app.entity_chunk_index = parsed.entity_chunk_index;
+                            app.map_seed = parsed.seed;
+                            app.map_controls = parsed.map_controls;
+                            *app.terrain_generator.borrow_mut() = None;
+                            app.terrain_cache.borrow_mut().clear();
+                            if parsed.map_width > 0 && parsed.map_height > 0 {
+                                let half_w = (parsed.map_width / 2) as f64;
+                                let half_h = (parsed.map_height / 2) as f64;
+                                app.map_bounds = Some(half_w.max(half_h));
+                            }
+                            if app.player_x == 0.0 && app.player_y == 0.0 {
+                                app.player_x = parsed.spawn.0;
+                                app.player_y = parsed.spawn.1;
+                            }
+                            app.log(
+                                format!(
+                                    "Parsed map: {} entities, {} tiles (seed={}, w={}, h={})",
+                                    app.entities.len(),
+                                    app.tiles.len(),
+                                    app.map_seed,
+                                    parsed.map_width,
+                                    parsed.map_height
+                                ),
+                                Color::Green,
+                            );
+                            app.show_parsed_map = true;
+                            app.status = "Offline Map Viewer".into();
+                            app.map_parse_rx = None;
+                            app.map_parse_handle = None;
+                        }
+                        Ok(Err(err)) => {
+                            app.log(format!("Map parse failed: {}", err), Color::Red);
+                            app.map_parse_rx = None;
+                            app.map_parse_handle = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            app.log("Map parse thread disconnected".to_string(), Color::Red);
+                            app.map_parse_rx = None;
+                            app.map_parse_handle = None;
+                        }
+                    }
+                }
+                if let Some(rx) = app.resource_parse_rx.as_ref() {
+                    match rx.try_recv() {
+                        Ok(resources) => {
+                            let before = app.entities.len();
+                            app.entities.extend(resources);
+                            app.entity_chunk_index = build_entity_chunk_index(&app.entities);
+                            let added = app.entities.len().saturating_sub(before);
+                            app.log(format!("Resources parsed: {} new entities", added), Color::Green);
+                            app.resource_parse_rx = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            app.resource_parse_rx = None;
+                        }
+                    }
+                }
+                app.clear_parse_progress_if_done();
             }
 
             _ => {}
@@ -866,7 +1292,7 @@ mod tui_main {
             if !conn.is_in_game() {
                 Err("Not in game".to_string())
             } else {
-                rt.block_on(conn.send_walk(direction))
+                rt.block_on(conn.actions().send_walk(direction))
                     .map_err(|e| e.to_string())
             }
         } else {
@@ -903,7 +1329,7 @@ mod tui_main {
                         return;
                     }
                     let result = if let Some(conn) = app.connection.as_mut() {
-                        rt.block_on(conn.send_chat(&message))
+                        rt.block_on(conn.actions().send_chat(&message))
                             .map_err(|e| e.to_string())
                     } else {
                         Err("Not connected".to_string())
@@ -976,10 +1402,10 @@ mod tui_main {
                         let mut stop_mine_err = None;
                         if let Some(conn) = app.connection.as_mut() {
                             if conn.is_in_game() {
-                                if let Err(e) = rt.block_on(conn.send_stop_walk()) {
+                                if let Err(e) = rt.block_on(conn.actions().send_stop_walk()) {
                                     stop_walk_err = Some(e.to_string());
                                 }
-                                if let Err(e) = rt.block_on(conn.send_stop_mine()) {
+                                if let Err(e) = rt.block_on(conn.actions().send_stop_mine()) {
                                     stop_mine_err = Some(e.to_string());
                                 }
                             }
@@ -994,7 +1420,7 @@ mod tui_main {
                     'm' => {
                         let (x, y) = app.cursor_world_pos();
                         let result = if let Some(conn) = app.connection.as_mut() {
-                            rt.block_on(conn.send_mine(x, y))
+                            rt.block_on(conn.actions().send_mine(x, y))
                                 .map_err(|e| e.to_string())
                         } else {
                             Err("Not connected".to_string())
@@ -1010,7 +1436,7 @@ mod tui_main {
                     'b' => {
                         let (x, y) = app.cursor_world_pos();
                         let result = if let Some(conn) = app.connection.as_mut() {
-                            rt.block_on(conn.send_build(x, y, 0))
+                            rt.block_on(conn.actions().send_build(x, y, 0))
                                 .map_err(|e| e.to_string())
                         } else {
                             Err("Not connected".to_string())
@@ -1022,7 +1448,7 @@ mod tui_main {
                     'r' => {
                         let (x, y) = app.cursor_world_pos();
                         let result = if let Some(conn) = app.connection.as_mut() {
-                            rt.block_on(conn.send_rotate(x, y, false))
+                            rt.block_on(conn.actions().send_rotate(x, y, false))
                                 .map_err(|e| e.to_string())
                         } else {
                             Err("Not connected".to_string())
@@ -1229,8 +1655,9 @@ mod tui_main {
         let cell_width = 2;
         let cols = width / cell_width;
         let y_stretch = Y_STRETCH;
+        let cell_half_x = 0.5 / zoom;
+        let cell_half_y = 0.5 * y_stretch / zoom;
 
-        let has_image_renderer = entity_icons.borrow().is_some();
         let buf = frame.buffer_mut();
 
         for row in 0..height {
@@ -1243,6 +1670,8 @@ mod tui_main {
                 let offset_y = (row - height / 2) as f64 * y_stretch / zoom;
                 let world_x = app.player_x + offset_x;
                 let world_y = app.player_y + offset_y;
+                let tile_x = world_x.floor() as i32;
+                let tile_y = world_y.floor() as i32;
 
                 let is_player = col == cols / 2 && row == height / 2;
                 let is_cursor = col - cols / 2 == app.cursor_dx && row - height / 2 == app.cursor_dy;
@@ -1256,18 +1685,32 @@ mod tui_main {
 
                 // Find entity at this position (only if showing parsed map)
                 let entity = if app.show_parsed_map {
-                    app.entities.iter().find(|e| {
-                        let half_w = e.tile_width() / 2.0;
-                        let half_h = e.tile_height() / 2.0;
-                        world_x >= e.x - half_w && world_x < e.x + half_w
-                            && world_y >= e.y - half_h && world_y < e.y + half_h
-                    })
+                    let chunk_x = tile_x.div_euclid(32);
+                    let chunk_y = tile_y.div_euclid(32);
+                    let cell_min_x = world_x - cell_half_x;
+                    let cell_max_x = world_x + cell_half_x;
+                    let cell_min_y = world_y - cell_half_y;
+                    let cell_max_y = world_y + cell_half_y;
+                    app.entity_chunk_index
+                        .get(&(chunk_x, chunk_y))
+                        .and_then(|indices| {
+                            indices.iter().find_map(|idx| {
+                                app.entities.get(*idx).and_then(|e| {
+                                    let half_w = e.tile_width() / 2.0;
+                                    let half_h = e.tile_height() / 2.0;
+                                    if cell_min_x < e.x + half_w && cell_max_x > e.x - half_w
+                                        && cell_min_y < e.y + half_h && cell_max_y > e.y - half_h
+                                    {
+                                        Some(e)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                        })
                 } else {
                     None
                 };
-
-                let tile_x = world_x.floor() as i32;
-                let tile_y = world_y.floor() as i32;
 
                 // Check if position is within map bounds
                 let in_bounds = app.map_bounds.map_or(true, |b| {
@@ -1279,13 +1722,17 @@ mod tui_main {
                     app.tile_index
                         .get(&(tile_x, tile_y))
                         .and_then(|idx| app.tiles.get(*idx))
-                        .filter(|t| !t.procedural) // Only non-procedural (parsed) tiles
+                        .filter(|t| !t.procedural)
                 } else {
                     None
                 };
 
+                let hide_map = matches!(app.state, AppState::Disconnected | AppState::Connecting | AppState::DownloadingMap)
+                    && app.map_seed == 0
+                    && !app.show_parsed_map;
+
                 // Compute procedural terrain as base layer (only if in bounds)
-                let procedural_tile_name = if in_bounds {
+                let procedural_tile_name = if in_bounds && !hide_map && (!app.show_parsed_map || app.tiles.is_empty()) {
                     Some(app.procedural_tile_at(tile_x, tile_y))
                 } else {
                     None
@@ -1299,23 +1746,13 @@ mod tui_main {
                     ("👤", Style::default().fg(color))
                 } else if is_cursor {
                     ("░░", Style::default().fg(Color::Yellow))
-                } else if !in_bounds {
+                } else if !in_bounds || hide_map {
                     // Out of bounds - show void
                     ("  ", Style::default().bg(Color::Black))
                 } else if let Some(ent) = entity {
-                    if has_image_renderer {
-                        // Image pass will render entity icons; show tile underneath
-                        if let Some(tile) = parsed_tile {
-                            ("  ", Style::default().bg(tile_color(&tile.name)))
-                        } else if let Some(name) = procedural_tile_name {
-                            ("  ", Style::default().bg(tile_color(name)))
-                        } else {
-                            ("  ", Style::default())
-                        }
-                    } else {
-                        let (icon, color) = entity_icon(&ent.name);
-                        (icon, Style::default().fg(color))
-                    }
+                    // Always draw a fallback icon in the text layer so entities remain visible
+                    let (icon, color) = entity_icon(&ent.name);
+                    (icon, Style::default().fg(color))
                 } else if let Some(tile) = parsed_tile {
                     // Parsed tile overlays procedural terrain
                     let color = tile_color(&tile.name);
@@ -1344,24 +1781,49 @@ mod tui_main {
                 }
 
                 let mut to_render: Vec<(Rect, String)> = Vec::new();
-                for entity in &app.entities {
-                    let dx = entity.x - app.player_x;
-                    let dy = entity.y - app.player_y;
-                    let screen_col = (dx * zoom).round() as i32 + cols / 2;
-                    let screen_row = (dy * zoom / Y_STRETCH).round() as i32 + height / 2;
-                    let ew = (entity.tile_width() * zoom).round() as i32;
-                    let eh = (entity.tile_height() * zoom / Y_STRETCH).round() as i32;
-                    if ew < 1 || eh < 1 { continue; }
-                    let x0 = screen_col - ew / 2;
-                    let y0 = screen_row - eh / 2;
-                    if x0 < 0 || y0 < 0 || x0 + ew > cols || y0 + eh > height { continue; }
-                    let rect = Rect::new(
-                        base_x + (x0 * cell_width) as u16,
-                        base_y + y0 as u16,
-                        (ew * cell_width) as u16,
-                        eh as u16,
-                    );
-                    to_render.push((rect, entity.name.clone()));
+                let view_tiles_x = cols as f64 / zoom;
+                let view_tiles_y = height as f64 * Y_STRETCH / zoom;
+                let min_tile_x = (app.player_x - view_tiles_x / 2.0).floor() as i32;
+                let max_tile_x = (app.player_x + view_tiles_x / 2.0).ceil() as i32;
+                let min_tile_y = (app.player_y - view_tiles_y / 2.0).floor() as i32;
+                let max_tile_y = (app.player_y + view_tiles_y / 2.0).ceil() as i32;
+                let min_chunk_x = min_tile_x.div_euclid(32);
+                let max_chunk_x = max_tile_x.div_euclid(32);
+                let min_chunk_y = min_tile_y.div_euclid(32);
+                let max_chunk_y = max_tile_y.div_euclid(32);
+
+                let mut seen = std::collections::HashSet::new();
+                for cy in min_chunk_y..=max_chunk_y {
+                    for cx in min_chunk_x..=max_chunk_x {
+                        if let Some(indices) = app.entity_chunk_index.get(&(cx, cy)) {
+                            for idx in indices {
+                                if !seen.insert(*idx) {
+                                    continue;
+                                }
+                                let entity = match app.entities.get(*idx) {
+                                    Some(e) => e,
+                                    None => continue,
+                                };
+                                let dx = entity.x - app.player_x;
+                                let dy = entity.y - app.player_y;
+                                let screen_col = (dx * zoom).round() as i32 + cols / 2;
+                                let screen_row = (dy * zoom / Y_STRETCH).round() as i32 + height / 2;
+                                let ew = (entity.tile_width() * zoom).round() as i32;
+                                let eh = (entity.tile_height() * zoom / Y_STRETCH).round() as i32;
+                                if ew < 1 || eh < 1 { continue; }
+                                let x0 = screen_col - ew / 2;
+                                let y0 = screen_row - eh / 2;
+                                if x0 < 0 || y0 < 0 || x0 + ew > cols || y0 + eh > height { continue; }
+                                let rect = Rect::new(
+                                    base_x + (x0 * cell_width) as u16,
+                                    base_y + y0 as u16,
+                                    (ew * cell_width) as u16,
+                                    eh as u16,
+                                );
+                                to_render.push((rect, entity.name.clone()));
+                            }
+                        }
+                    }
                 }
 
                 // Ensure images and protocols exist for visible entity types
@@ -1486,7 +1948,10 @@ mod tui_main {
     }
 
     fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-        let text = if app.chat_mode {
+        let parse_line = app.map_parse_status_line();
+        let text = if let Some(line) = parse_line {
+            format!(" {} ", line)
+        } else if app.chat_mode {
             format!(" Chat: {}_ ", app.chat_input)
         } else if app.mining {
             " MINING... [M] to stop ".into()
@@ -1494,7 +1959,9 @@ mod tui_main {
             " WASD:move  IJKL:cursor  +/-:zoom  M:mine  B:build  R:rotate  P:toggle-map  C:chat  H:help  Q:quit ".into()
         };
 
-        let style = if app.chat_mode {
+        let style = if parse_line.is_some() {
+            Style::default().fg(Color::Yellow)
+        } else if app.chat_mode {
             Style::default().fg(Color::Black).bg(Color::Yellow)
         } else if app.mining {
             Style::default().fg(Color::Black).bg(Color::Yellow)

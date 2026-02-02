@@ -1,8 +1,9 @@
 use super::BinaryReader;
+use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::lua::prototype::Prototypes;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapEntity {
     pub name: String,
     pub x: f64,
@@ -13,6 +14,9 @@ pub struct MapEntity {
     pub col_x2: f64,
     pub col_y2: f64,
     pub collides_player: bool,
+    pub resource_amount: Option<u32>,
+    pub resource_infinite: bool,
+    pub underground_type: Option<u8>,
 }
 
 impl MapEntity {
@@ -29,6 +33,7 @@ pub fn check_player_collision(entities: &[MapEntity], px: f64, py: f64) -> bool 
     let p_half = 0.2;
     entities.iter().any(|e| {
         e.collides_player
+            && e.name != "character"
             && px - p_half < e.x + e.col_x2
             && px + p_half > e.x + e.col_x1
             && py - p_half < e.y + e.col_y2
@@ -54,7 +59,7 @@ pub fn entity_collision_box(name: &str) -> ([f64; 4], bool) {
     ([-half, -half, half, half], true)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapTile {
     pub name: String,
     pub x: i32,
@@ -62,7 +67,7 @@ pub struct MapTile {
     pub procedural: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MapVersion {
     pub major: u16,
     pub minor: u16,
@@ -83,14 +88,14 @@ impl MapVersion {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurfaceData {
     pub name: String,
     pub index: u16,
     pub chunks: Vec<ChunkData>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkData {
     pub position: (i32, i32),
     pub entities: Vec<EntityData>,
@@ -98,7 +103,7 @@ pub struct ChunkData {
     pub decoratives: Vec<DecorativeData>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityData {
     pub prototype_id: u16,
     pub position: (f64, f64),
@@ -107,7 +112,7 @@ pub struct EntityData {
     pub bbox_max: (f64, f64),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileData {
     pub prototype_id: u16,
     pub x: u8,
@@ -115,7 +120,7 @@ pub struct TileData {
     pub variation: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecorativeData {
     pub prototype_id: u16,
     pub x: u8,

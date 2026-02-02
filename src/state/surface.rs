@@ -127,18 +127,37 @@ pub struct Tile {
     pub name: String,
     pub collides_with_player: bool,
     pub is_water: bool,
+    pub walking_speed_modifier: f64,
 }
 
 impl Tile {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
-        let is_water = name.contains("water") || name.contains("deepwater");
-        let collides_with_player = is_water || name.contains("out-of-map");
-        Self {
+        let mut tile = Self {
             name,
-            collides_with_player,
-            is_water,
+            collides_with_player: false,
+            is_water: false,
+            walking_speed_modifier: 1.0,
+        };
+
+        // Use Lua prototypes if available to set accurate collision + walking speed.
+        if let Some(proto) = crate::lua::prototype::Prototypes::global()
+            .and_then(|p| p.tile(&tile.name))
+        {
+            tile.walking_speed_modifier = proto.walking_speed_modifier;
+            if let Some(mask) = &proto.collision_mask {
+                tile.collides_with_player = mask.iter().any(|l| l == "player" || l == "out_of_map");
+                tile.is_water = mask.iter().any(|l| l == "water_tile");
+            }
         }
+
+        // Fallback heuristics if prototypes are missing.
+        if !tile.collides_with_player {
+            tile.is_water = tile.name.contains("water") || tile.name.contains("deepwater");
+            tile.collides_with_player = tile.is_water || tile.name.contains("out-of-map");
+        }
+
+        tile
     }
 }
 

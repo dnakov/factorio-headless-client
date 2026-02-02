@@ -88,7 +88,8 @@ impl<'a> TilePathfinder<'a> {
         let mut expanded = 0usize;
         while let Some(current) = open.pop() {
             if current.pos == goal_pos {
-                return Some(self.reconstruct_path(start_pos, goal_pos, goal, came_from));
+                let path = self.reconstruct_path(start_pos, goal_pos, goal, came_from);
+                return Some(self.smooth_path(path));
             }
 
             let best_g = match g_score.get(&current.pos) {
@@ -192,7 +193,22 @@ impl<'a> TilePathfinder<'a> {
 
         let px = x as f64 + 0.5;
         let py = y as f64 + 0.5;
-        !check_player_collision(&self.map.entities, px, py)
+        if check_player_collision(&self.map.entities, px, py) {
+            return false;
+        }
+        let offset = 0.22;
+        let samples = [
+            (px + offset, py),
+            (px - offset, py),
+            (px, py + offset),
+            (px, py - offset),
+        ];
+        for (sx, sy) in samples {
+            if check_player_collision(&self.map.entities, sx, sy) {
+                return false;
+            }
+        }
+        true
     }
 
     fn tile_speed(&self, x: i32, y: i32) -> f64 {
@@ -210,6 +226,63 @@ impl<'a> TilePathfinder<'a> {
             .get(&(x, y))
             .and_then(|idx| self.map.tiles.get(*idx))
             .map(|t| t.name.as_str())
+    }
+
+    fn is_walkable_at(&self, px: f64, py: f64) -> bool {
+        let tx = px.floor() as i32;
+        let ty = py.floor() as i32;
+        if let Some(tile_name) = self.tile_name(tx, ty) {
+            if !tile_walkable(tile_name) {
+                return false;
+            }
+        }
+        !check_player_collision(&self.map.entities, px, py)
+    }
+
+    fn line_of_sight(&self, a: MapPosition, b: MapPosition) -> bool {
+        let (ax, ay) = a.to_tiles();
+        let (bx, by) = b.to_tiles();
+        let dx = bx - ax;
+        let dy = by - ay;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist == 0.0 {
+            return true;
+        }
+        let step = 0.25;
+        let steps = (dist / step).ceil() as i32;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let px = ax + dx * t;
+            let py = ay + dy * t;
+            if !self.is_walkable_at(px, py) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn smooth_path(&self, path: Vec<MapPosition>) -> Vec<MapPosition> {
+        if path.len() < 3 {
+            return path;
+        }
+        let mut smoothed = Vec::new();
+        let mut anchor = 0usize;
+        smoothed.push(path[0]);
+        let mut idx = 1usize;
+        while idx < path.len() {
+            if self.line_of_sight(path[anchor], path[idx]) {
+                idx += 1;
+                continue;
+            }
+            smoothed.push(path[idx - 1]);
+            anchor = idx - 1;
+        }
+        if let Some(last) = path.last().copied() {
+            if smoothed.last().copied() != Some(last) {
+                smoothed.push(last);
+            }
+        }
+        smoothed
     }
 }
 

@@ -14,6 +14,18 @@ pub struct GameWorld {
     /// Game seed
     pub seed: u32,
 
+    /// Default character movement speed (tiles per tick)
+    pub character_speed: f64,
+    /// Character animation distance per frame (from prototypes)
+    pub character_distance_per_frame: f64,
+    /// Maximum corner sliding distance (from prototypes)
+    pub character_max_corner_sliding_distance: f64,
+    /// Character collision box (relative to center)
+    pub character_collision_box: [f64; 4],
+
+    /// Default spawn position
+    pub spawn_position: MapPosition,
+
     /// All surfaces (nauvis, space, etc.)
     pub surfaces: HashMap<SurfaceId, Surface>,
 
@@ -29,6 +41,16 @@ pub struct GameWorld {
     /// Recipe database (populated from map data)
     pub recipes: RecipeDatabase,
 
+    /// Train schedules and state (keyed by locomotive entity id)
+    pub trains: HashMap<u32, TrainState>,
+
+    /// Prototype ID mappings
+    pub item_id_map: HashMap<u16, String>,
+    pub recipe_id_map: HashMap<u16, String>,
+    pub entity_id_map: HashMap<u16, String>,
+    pub tile_id_map: HashMap<u16, String>,
+    pub tech_id_map: HashMap<u16, String>,
+
     /// Global entity ID counter
     next_entity_id: EntityId,
 }
@@ -38,11 +60,22 @@ impl GameWorld {
         let mut world = Self {
             tick: 0,
             seed: 0,
+            character_speed: 0.15,
+            character_distance_per_frame: 0.13,
+            character_max_corner_sliding_distance: 0.7,
+            character_collision_box: [-0.2, -0.2, 0.2, 0.2],
+            spawn_position: MapPosition::default(),
             surfaces: HashMap::new(),
             players: HashMap::new(),
             research: ResearchState::new(),
             forces: HashMap::new(),
             recipes: RecipeDatabase::new(),
+            trains: HashMap::new(),
+            item_id_map: HashMap::new(),
+            recipe_id_map: HashMap::new(),
+            entity_id_map: HashMap::new(),
+            tile_id_map: HashMap::new(),
+            tech_id_map: HashMap::new(),
             next_entity_id: 1,
         };
 
@@ -146,6 +179,20 @@ impl GameWorld {
     pub fn advance_tick(&mut self) {
         self.tick += 1;
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TrainState {
+    pub schedule: Vec<TrainScheduleRecord>,
+    pub current: usize,
+    pub manual_mode: bool,
+    pub speed: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrainScheduleRecord {
+    pub station: String,
+    pub position: Option<(f64, f64)>,
 }
 
 impl Default for GameWorld {

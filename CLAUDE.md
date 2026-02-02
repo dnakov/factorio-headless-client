@@ -2,6 +2,10 @@
 
 Rust library for connecting to Factorio 2.0 multiplayer servers as a bot/automation client.
 
+## Important Rules
+
+- DO NOT USE pkill
+
 ## Project Structure
 
 ```

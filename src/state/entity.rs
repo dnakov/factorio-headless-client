@@ -1,4 +1,6 @@
 use crate::codec::{MapPosition, Direction, Color};
+use crate::lua::prototype::EntityPrototype;
+use crate::state::inventory::{Inventory, ItemStack};
 use std::collections::HashMap;
 
 /// Unique entity identifier
@@ -20,6 +22,8 @@ pub struct Entity {
     pub max_health: Option<f32>,
     pub active: bool,
     pub data: EntityData,
+    pub inventories: HashMap<String, Inventory>,
+    pub item_stack: Option<ItemStack>,
 }
 
 impl Entity {
@@ -35,6 +39,8 @@ impl Entity {
             max_health: None,
             active: true,
             data: EntityData::None,
+            inventories: HashMap::new(),
+            item_stack: None,
         }
     }
 
@@ -46,6 +52,101 @@ impl Entity {
     pub fn with_direction(mut self, direction: Direction) -> Self {
         self.direction = direction;
         self
+    }
+}
+
+pub fn default_entity_data_for_type(entity_type: EntityType) -> EntityData {
+    match entity_type {
+        EntityType::AssemblingMachine => EntityData::AssemblingMachine(Default::default()),
+        EntityType::Furnace => EntityData::Furnace(Default::default()),
+        EntityType::Container | EntityType::LogisticContainer => EntityData::Container(Default::default()),
+        EntityType::TransportBelt | EntityType::UndergroundBelt | EntityType::Splitter => {
+            EntityData::TransportBelt(Default::default())
+        }
+        EntityType::Inserter => EntityData::Inserter(Default::default()),
+        EntityType::MiningDrill => EntityData::MiningDrill(Default::default()),
+        EntityType::Lab => EntityData::Lab(Default::default()),
+        EntityType::Accumulator => EntityData::Accumulator(Default::default()),
+        EntityType::ArithmeticCombinator
+        | EntityType::DeciderCombinator
+        | EntityType::ConstantCombinator => EntityData::Combinator(Default::default()),
+        EntityType::TrainStop => EntityData::TrainStop(Default::default()),
+        EntityType::RocketSilo => EntityData::RocketSilo(Default::default()),
+        EntityType::Roboport => EntityData::Roboport(Default::default()),
+        _ => EntityData::None,
+    }
+}
+
+pub fn init_entity_inventories(entity: &mut Entity) {
+    match entity.entity_type {
+        EntityType::Container | EntityType::LogisticContainer => {
+            entity.inventories.insert("main".into(), Inventory::new(48));
+        }
+        EntityType::Furnace => {
+            entity.inventories.insert("source".into(), Inventory::new(2));
+            entity.inventories.insert("result".into(), Inventory::new(2));
+            entity.inventories.insert("fuel".into(), Inventory::new(1));
+        }
+        EntityType::AssemblingMachine => {
+            entity.inventories.insert("input".into(), Inventory::new(6));
+            entity.inventories.insert("output".into(), Inventory::new(6));
+            entity.inventories.insert("fuel".into(), Inventory::new(1));
+        }
+        EntityType::MiningDrill => {
+            entity.inventories.insert("output".into(), Inventory::new(6));
+            entity.inventories.insert("fuel".into(), Inventory::new(1));
+        }
+        _ => {}
+    }
+}
+
+pub fn init_belt_metadata(entity: &mut Entity) {
+    let crate::state::entity::EntityData::TransportBelt(ref mut data) = entity.data else {
+        return;
+    };
+    data.is_underground = entity.entity_type == EntityType::UndergroundBelt;
+    data.is_splitter = entity.entity_type == EntityType::Splitter;
+    if !data.is_underground {
+        data.underground_type = None;
+    }
+}
+
+pub fn apply_entity_prototype(entity: &mut Entity, proto: &EntityPrototype) {
+    match &mut entity.data {
+        EntityData::Resource(data) => {
+            if data.mining_time <= 0.0 {
+                if let Some(mining_time) = proto.resource_mining_time {
+                    data.mining_time = mining_time as f32;
+                }
+            }
+        }
+        EntityData::AssemblingMachine(data) => {
+            if data.crafting_speed <= 0.0 {
+                if let Some(speed) = proto.crafting_speed {
+                    data.crafting_speed = speed as f32;
+                }
+            }
+        }
+        EntityData::Furnace(data) => {
+            if data.crafting_speed <= 0.0 {
+                if let Some(speed) = proto.crafting_speed {
+                    data.crafting_speed = speed as f32;
+                }
+            }
+        }
+        EntityData::MiningDrill(data) => {
+            if data.mining_speed <= 0.0 {
+                if let Some(speed) = proto.mining_speed {
+                    data.mining_speed = speed as f32;
+                }
+            }
+        }
+        EntityData::TransportBelt(data) => {
+            if data.underground_max_distance.is_none() {
+                data.underground_max_distance = proto.underground_max_distance;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -170,6 +271,7 @@ pub fn entity_type_from_name(name: &str) -> EntityType {
 #[derive(Debug, Clone)]
 pub enum EntityData {
     None,
+    Resource(ResourceData),
     Inserter(InserterData),
     AssemblingMachine(AssemblingMachineData),
     Furnace(FurnaceData),
@@ -185,12 +287,20 @@ pub enum EntityData {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ResourceData {
+    pub amount: u32,
+    pub infinite: bool,
+    pub mining_time: f32,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct InserterData {
     pub pickup_position: Option<MapPosition>,
     pub drop_position: Option<MapPosition>,
     pub filter_mode: Option<String>,
     pub filters: Vec<String>,
     pub stack_size_override: Option<u8>,
+    pub cooldown: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,6 +315,7 @@ pub struct AssemblingMachineData {
 pub struct FurnaceData {
     pub smelting_recipe: Option<String>,
     pub crafting_progress: f32,
+    pub crafting_speed: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -215,12 +326,19 @@ pub struct ContainerData {
 #[derive(Debug, Clone, Default)]
 pub struct TransportBeltData {
     pub line_contents: Vec<String>,
+    pub lane_items: [Vec<String>; 2],
+    pub lane_progress: [f64; 2],
+    pub underground_max_distance: Option<u8>,
+    pub is_underground: bool,
+    pub is_splitter: bool,
+    pub underground_type: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MiningDrillData {
     pub mining_target: Option<String>,
     pub mining_progress: f32,
+    pub mining_speed: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,4 +380,3 @@ pub struct RoboportData {
     pub total_construction_robots: u32,
     pub total_logistic_robots: u32,
 }
-
