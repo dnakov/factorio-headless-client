@@ -3247,7 +3247,12 @@ impl Connection {
 
         // Update heartbeat timestamp for ANY heartbeat packet (fragmented or not)
         // to prevent timeout while collecting fragments.
-        self.last_server_heartbeat_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let old_elapsed = self.last_server_heartbeat_at.map(|t| now.duration_since(t).as_millis());
+        self.last_server_heartbeat_at = Some(now);
+        if std::env::var("FACTORIO_DEBUG_TIMEOUT").is_ok() && old_elapsed.unwrap_or(0) > 500 {
+            eprintln!("[DEBUG] HB: timestamp reset after {}ms gap", old_elapsed.unwrap_or(0));
+        }
 
         // Reassemble fragmented heartbeats before parsing payload.
         if header.fragmented {
@@ -3257,15 +3262,7 @@ impl Connection {
             return Ok(());
         }
 
-        let hb_start = std::time::Instant::now();
-        let now = std::time::Instant::now();
-        let old_elapsed = self.last_server_heartbeat_at.map(|t| t.elapsed().as_millis());
-        // Verify the timestamp was actually set
-        let verify_elapsed = self.last_server_heartbeat_at.map(|t| t.elapsed().as_millis()).unwrap_or(99999);
-        if std::env::var("FACTORIO_DEBUG_TIMEOUT").is_ok() && self.state == ConnectionState::InGame {
-            eprintln!("[DEBUG] poll#{}: process_server_heartbeat START (old_elapsed={:?}ms verify_elapsed={}ms)", self.debug_current_poll_id, old_elapsed, verify_elapsed);
-        }
-        let _hb_start = hb_start; // keep for later timing
+        // Timestamp already updated above at line 3252
 
         // Payload layout per binary RE (docs/heartbeat-architecture.md):
         // [0] flags
@@ -3532,14 +3529,6 @@ impl Connection {
         self.update_player_index_from_heartbeat(data);
         if std::env::var("FACTORIO_DEBUG_TIMEOUT").is_ok() && update_start.elapsed().as_millis() > 100 {
             eprintln!("[DEBUG] poll#{}: update_player_index_from_heartbeat took {}ms", self.debug_current_poll_id, update_start.elapsed().as_millis());
-        }
-
-        // Debug: time how long process_server_heartbeat took
-        if std::env::var("FACTORIO_DEBUG_TIMEOUT").is_ok() && self.state == ConnectionState::InGame {
-            let hb_elapsed = _hb_start.elapsed().as_millis();
-            if hb_elapsed > 100 {
-                eprintln!("[DEBUG] poll#{}: process_server_heartbeat END took {}ms", self.debug_current_poll_id, hb_elapsed);
-            }
         }
 
         Ok(())
